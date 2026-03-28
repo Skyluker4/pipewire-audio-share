@@ -43,6 +43,8 @@ declare -A SKIPPED=()       # node_name → "1"  (streams we skipped, e.g. peer-
 declare -A MOVED_INPUTS=()  # pactl_index → original_sink  (for mute-local restore)
 declare -A MANUAL_ADD=()    # node_name → "1"  (user explicitly added via TUI)
 declare -A MANUAL_REMOVE=() # node_name → "1"  (user explicitly removed via TUI)
+declare -i SKIP_RETRY_CTR=0 # cycle counter for periodic SKIPPED re-evaluation
+SKIP_RETRY_EVERY=15         # retry skipped streams every N poll cycles (~30s at 2s poll)
 TUI_ACTIVE=false            # true while the interactive TUI owns the screen
 declare -a TUI_MESSAGES=()  # ring buffer of recent warnings/errors for TUI
 
@@ -670,15 +672,17 @@ link_stream_to_sink() {
 			continue
 		fi
 
-		if pw-link -- "$out_port" "$in_port" 2>/dev/null; then
+		local link_err
+		if link_err=$(pw-link -- "$out_port" "$in_port" 2>&1); then
 			log "  Linked ${out_port} → ${in_port}"
 			linked=true
 		else
 			# May already exist (race) — treat "File exists" as success
-			if link_exists "$out_port" "$in_port"; then
+			if [[ "$link_err" == *"File exists"* ]] || link_exists "$out_port" "$in_port"; then
+				debug "  Link already present (confirmed): ${out_port} → ${in_port}"
 				linked=true
 			else
-				warn "  Failed to link ${out_port} → ${in_port}"
+				warn "  Failed to link ${out_port} → ${in_port}: ${link_err}"
 			fi
 		fi
 	done <<<"$out_ports"
@@ -954,21 +958,30 @@ verify_existing_links() {
 		unset "MOVED_INPUTS[$node_name]" 2>/dev/null || true
 	done
 
-	# Re-evaluate previously skipped streams (the owning peer may have stopped)
+	# Re-evaluate previously skipped streams.
+	((++SKIP_RETRY_CTR))
 	for node_name in "${!SKIPPED[@]}"; do
-		# Stream gone? Drop it.
+		# Stream gone? Drop the skip so it's retried if it reappears.
 		if ! pw-link -o 2>/dev/null | grep -q "^${node_name}:"; then
 			unset "SKIPPED[$node_name]"
 			continue
 		fi
-		# Still owned by a peer? Keep skipping.
-		if [[ "$MUTE_LOCAL" == true ]] && stream_owned_by_peer "$node_name"; then
+		# In mute-local mode, retry if the owning peer released it.
+		if [[ "$MUTE_LOCAL" == true ]] && ! stream_owned_by_peer "$node_name"; then
+			debug "Peer released ${node_name}; will retry capture"
+			unset "SKIPPED[$node_name]"
 			continue
 		fi
-		# Peer released it — allow scan_new_streams to pick it up next cycle.
-		debug "Peer released ${node_name}; will retry capture"
-		unset "SKIPPED[$node_name]"
+		# Periodic retry: clear the skip every N cycles in case a transient
+		# failure (PipeWire hiccup, stream recreation) has resolved.
+		if ((SKIP_RETRY_CTR >= SKIP_RETRY_EVERY)); then
+			debug "Periodic retry for skipped stream: ${node_name}"
+			unset "SKIPPED[$node_name]"
+		fi
 	done
+	if ((SKIP_RETRY_CTR >= SKIP_RETRY_EVERY)); then
+		SKIP_RETRY_CTR=0
+	fi
 }
 
 # ─── cleanup ─────────────────────────────────────────────────────────────────
