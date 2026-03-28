@@ -15,18 +15,18 @@ playback with `--mute-local`.
 
 ## Features
 
-| Feature                   | Description                                                                                   |
-| ------------------------- | --------------------------------------------------------------------------------------------- |
-| **Virtual null sink**     | Creates a dedicated PipeWire sink with monitor ports that capture software can read           |
-| **Auto-capture**          | Automatically routes every new audio stream into the sink (on by default)                     |
-| **Whitelist / Blacklist** | Case-insensitive substring matching against application and node names                        |
-| **Mute local**            | Optionally silence captured streams on your speakers — restored on exit                       |
-| **Multiple instances**    | Run several sinks simultaneously with independent filters and options                         |
-| **Instance management**   | `--status`, `--stop`, `--stop-all` for controlling background instances                       |
-| **Stale recovery**        | Crashed instances leave no orphaned sinks — automatically cleaned up                          |
-| **Interactive TUI**       | Full terminal UI for live stream toggling, volume control, output routing, and config editing |
-| **Default-sink aware**    | Tracks the _current_ default sink dynamically, not just the one at startup                    |
-| **Peer-aware muting**     | Multiple `--mute-local` instances won't fight over the same stream                            |
+| Feature                 | Description                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------- |
+| **Virtual null sink**   | Creates a dedicated PipeWire sink with monitor ports that capture software can read           |
+| **Auto-capture**        | Automatically routes every new audio stream into the sink (on by default)                     |
+| **Include / Exclude**   | Case-insensitive substring matching against application and node names                        |
+| **Mute local**          | Optionally silence captured streams on your speakers — restored on exit                       |
+| **Multiple instances**  | Run several sinks simultaneously with independent filters and options                         |
+| **Instance management** | `--status`, `--stop`, `--stop-all` for controlling background instances                       |
+| **Stale recovery**      | Crashed instances leave no orphaned sinks — automatically cleaned up                          |
+| **Interactive TUI**     | Full terminal UI for live stream toggling, volume control, output routing, and config editing |
+| **Default-sink aware**  | Tracks the _current_ default sink dynamically, not just the one at startup                    |
+| **Peer-aware muting**   | Multiple `--mute-local` instances won't fight over the same stream                            |
 
 ---
 
@@ -79,10 +79,10 @@ Bash script.
 ./audio-share.sh
 
 # Share only Firefox and mpv
-./audio-share.sh -w firefox -w mpv
+./audio-share.sh -I firefox -I mpv
 
 # Share everything except notification sounds
-./audio-share.sh -b notification -b alert
+./audio-share.sh -X notification -X alert
 
 # Share everything, silence local speakers (restored on exit)
 ./audio-share.sh --mute-local
@@ -114,8 +114,8 @@ audio-share.sh --stop-all
 | `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc. | `Audio Share` |
 | `-a`, `--auto-capture`       | Capture new streams as they appear                   | **on**        |
 | `-A`, `--no-auto-capture`    | Only capture streams present at startup              |               |
-| `-w`, `--whitelist APP`      | Application pattern to capture (repeatable)          |               |
-| `-b`, `--blacklist APP`      | Application pattern to exclude (repeatable)          |               |
+| `-I`, `--include APP`        | Application pattern to capture (repeatable)          |               |
+| `-X`, `--exclude APP`        | Application pattern to exclude (repeatable)          |               |
 | `-m`, `--mute-local`         | Don't play captured audio on the default output      | off           |
 | `-p`, `--poll-interval SECS` | How often to scan for changes                        | `2`           |
 | `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)         |               |
@@ -132,14 +132,14 @@ audio-share.sh --stop-all
 
 ### Pattern matching
 
-Whitelist and blacklist patterns are matched **case-insensitively** as
+Include and exclude patterns are matched **case-insensitively** as
 **substrings** against both the PipeWire `node.name`
 (e.g. `alsa_playback.firefox`) and the `application.name`
 (e.g. `Firefox`).
 
-Partial matches work: `-w fire` captures Firefox.
+Partial matches work: `-I fire` captures Firefox.
 
-Whitelist and blacklist are mutually exclusive.
+Include and exclude are mutually exclusive.
 
 ---
 
@@ -149,7 +149,7 @@ Launch with `-i`:
 
 ```sh
 ./audio-share.sh -i
-./audio-share.sh -i -n sunshine -w firefox -w mpv -w steam
+./audio-share.sh -i -n sunshine -I firefox -I mpv -I steam
 ```
 
 The TUI runs inside an **alternate screen buffer** so it doesn't pollute
@@ -161,7 +161,7 @@ your scrollback. Background monitoring continues while you navigate menus.
 Main ─┬─ [s] Streams ── toggle capture on individual applications
       ├─ [v] Volume ─── adjust sink and per-stream volume, mute/unmute
       ├─ [o] Output ─── switch default hardware sink, toggle mute-local
-      ├─ [c] Config ─── auto-capture, poll interval, whitelist/blacklist
+      ├─ [c] Config ─── auto-capture, poll interval, include/exclude
       ├─ [i] Info ───── sink details, captured streams, running instances
       └─ [q] Quit
 ```
@@ -177,7 +177,7 @@ Main ─┬─ [s] Streams ── toggle capture on individual applications
 | **r**             | Release all streams                   |
 | **b / Esc**       | Back to main menu                     |
 
-Manually toggled streams override the whitelist/blacklist. A manually
+Manually toggled streams override the include/exclude. A manually
 removed stream won't be re-captured by auto-capture, and a manually added
 stream ignores filters.
 
@@ -204,14 +204,14 @@ Volume bars are colour-coded: green ≤60%, yellow 61–85%, red >85%.
 
 ### Config menu
 
-| Key         | Action                                                |
-| ----------- | ----------------------------------------------------- |
-| **a**       | Toggle auto-capture                                   |
-| **m**       | Toggle mute-local                                     |
-| **p**       | Change poll interval (prompts for input)              |
-| **w**       | Edit whitelist (prompts for comma-separated patterns) |
-| **e**       | Edit blacklist (prompts for comma-separated patterns) |
-| **b / Esc** | Back                                                  |
+| Key         | Action                                              |
+| ----------- | --------------------------------------------------- |
+| **a**       | Toggle auto-capture                                 |
+| **m**       | Toggle mute-local                                   |
+| **p**       | Change poll interval (prompts for input)            |
+| **w**       | Edit include (prompts for comma-separated patterns) |
+| **e**       | Edit exclude (prompts for comma-separated patterns) |
+| **b / Esc** | Back                                                |
 
 ---
 
@@ -221,10 +221,10 @@ Run as many instances as you need with different `--sink-name` values:
 
 ```sh
 # Terminal 1: Sunshine gets browser and game audio
-audio-share.sh -n sunshine -d "Sunshine" -w firefox -w steam &
+audio-share.sh -n sunshine -d "Sunshine" -I firefox -I steam &
 
 # Terminal 2: Discord bot gets only the music player, silenced locally
-audio-share.sh -n discord -d "Discord Bot" -w music --mute-local &
+audio-share.sh -n discord -d "Discord Bot" -I music --mute-local &
 
 # Check on them
 audio-share.sh --status
@@ -337,7 +337,7 @@ streaming server compatible with Moonlight.
    ```
 
 3. All desktop audio now streams to your Moonlight client. Add
-   `-w` to limit which applications are shared, or
+   `-I` to limit which applications are shared, or
    `--mute-local` to silence local speakers while streaming.
 
 ### OBS Studio

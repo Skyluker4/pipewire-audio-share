@@ -29,8 +29,8 @@ MUTE_LOCAL=false
 POLL_INTERVAL=2
 VERBOSE=false
 INTERACTIVE=false
-declare -a WHITELIST=()
-declare -a BLACKLIST=()
+declare -a INCLUDE=()
+declare -a EXCLUDE=()
 
 # ─── runtime state ───────────────────────────────────────────────────────────
 
@@ -128,11 +128,11 @@ usage() {
 		"    Capture new streams as they appear (default)" \
 		"-A, --no-auto-capture" \
 		"    Only capture streams present at start-up" \
-		"-w, --whitelist APP" \
+		"-I, --include APP" \
 		"    Application pattern to capture (repeatable)" \
-		"-b, --blacklist APP" \
+		"-X, --exclude APP" \
 		"    Application pattern to exclude (repeatable)" \
-		"    (whitelist and blacklist are mutually exclusive)" \
+		"    (include and exclude are mutually exclusive)" \
 		"-m, --mute-local" \
 		"    Do NOT play captured audio on the default output" \
 		"    (moves streams exclusively to the virtual sink)" \
@@ -154,7 +154,7 @@ usage() {
 		"Patterns are matched case-insensitively as substrings against" \
 		"both the PipeWire node.name (e.g. \"alsa_playback.firefox\") and" \
 		"the application.name (e.g. \"Firefox\").  Partial matches work:" \
-		"-w fire matches Firefox."
+		"-I fire matches Firefox."
 
 	_usage_section "HOW IT WORKS" \
 		"1. A module-null-sink is loaded, creating a virtual sink with" \
@@ -189,24 +189,24 @@ usage() {
 		"audio-share.sh" \
 		"" \
 		"# share only firefox and mpv" \
-		"audio-share.sh -w firefox -w mpv" \
+		"audio-share.sh -I firefox -I mpv" \
 		"" \
 		"# share everything except notification sounds" \
-		"audio-share.sh -b notification -b alert" \
+		"audio-share.sh -X notification -X alert" \
 		"" \
 		"# share everything, silence local speakers" \
 		"audio-share.sh --mute-local" \
 		"" \
 		"# multiple instances" \
-		"audio-share.sh -n sunshine -d \"Sunshine\" -w firefox -w mpv &" \
-		"audio-share.sh -n discord -d \"Discord\" -w music -m &" \
+		"audio-share.sh -n sunshine -d \"Sunshine\" -I firefox -I mpv &" \
+		"audio-share.sh -n discord -d \"Discord\" -I music -m &" \
 		"audio-share.sh --status" \
 		"audio-share.sh --stop sunshine" \
 		"audio-share.sh --stop-all" \
 		"" \
 		"# interactive mode" \
 		"audio-share.sh -i" \
-		"audio-share.sh -i -n sunshine -w firefox -w mpv"
+		"audio-share.sh -i -n sunshine -I firefox -I mpv"
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -246,12 +246,12 @@ parse_args() {
 			AUTO_CAPTURE=false
 			shift
 			;;
-		-w | --whitelist)
-			WHITELIST+=("$2")
+		-I | --include)
+			INCLUDE+=("$2")
 			shift 2
 			;;
-		-b | --blacklist)
-			BLACKLIST+=("$2")
+		-X | --exclude)
+			EXCLUDE+=("$2")
 			shift 2
 			;;
 		-m | --mute-local)
@@ -279,8 +279,8 @@ parse_args() {
 	done
 
 	if [[ "$ACTION" == "run" ]]; then
-		if ((${#WHITELIST[@]} > 0 && ${#BLACKLIST[@]} > 0)); then
-			die "Cannot use --whitelist and --blacklist together"
+		if ((${#INCLUDE[@]} > 0 && ${#EXCLUDE[@]} > 0)); then
+			die "Cannot use --include and --exclude together"
 		fi
 		if [[ "$INTERACTIVE" == true ]] && ! [[ -t 0 && -t 2 ]]; then
 			die "Interactive mode requires a terminal (stdin and stderr must be TTY)"
@@ -588,10 +588,10 @@ stream_matches_filter() {
 	# Build a lower-cased haystack from both identifiers
 	local haystack="${node_name,,} ${app_name,,}"
 
-	# ── whitelist mode ──
-	if ((${#WHITELIST[@]} > 0)); then
+	# ── include mode ──
+	if ((${#INCLUDE[@]} > 0)); then
 		local pat
-		for pat in "${WHITELIST[@]}"; do
+		for pat in "${INCLUDE[@]}"; do
 			pat="${pat,,}"
 			pat="${pat#"${pat%%[![:space:]]*}"}" # trim leading
 			pat="${pat%"${pat##*[![:space:]]}"}" # trim trailing
@@ -600,10 +600,10 @@ stream_matches_filter() {
 		return 1
 	fi
 
-	# ── blacklist mode ──
-	if ((${#BLACKLIST[@]} > 0)); then
+	# ── exclude mode ──
+	if ((${#EXCLUDE[@]} > 0)); then
 		local pat
-		for pat in "${BLACKLIST[@]}"; do
+		for pat in "${EXCLUDE[@]}"; do
 			pat="${pat,,}"
 			pat="${pat#"${pat%%[![:space:]]*}"}"
 			pat="${pat%"${pat##*[![:space:]]}"}"
@@ -1705,20 +1705,20 @@ tui_menu_config() {
 		printf '  %b[p]%b Poll interval:  %ss\n' "$_Y" "$_N" "$POLL_INTERVAL" >&2
 
 		printf '\n' >&2
-		if ((${#WHITELIST[@]} > 0)); then
-			printf '  Whitelist: %s\n' "${WHITELIST[*]}" >&2
+		if ((${#INCLUDE[@]} > 0)); then
+			printf '  Include: %s\n' "${INCLUDE[*]}" >&2
 		else
-			printf '  Whitelist: %b(none)%b\n' "$_D" "$_N" >&2
+			printf '  Include: %b(none)%b\n' "$_D" "$_N" >&2
 		fi
-		printf '  %b[w]%b Edit whitelist\n' "$_Y" "$_N" >&2
+		printf '  %b[w]%b Edit include\n' "$_Y" "$_N" >&2
 
 		printf '\n' >&2
-		if ((${#BLACKLIST[@]} > 0)); then
-			printf '  Blacklist: %s\n' "${BLACKLIST[*]}" >&2
+		if ((${#EXCLUDE[@]} > 0)); then
+			printf '  Exclude: %s\n' "${EXCLUDE[*]}" >&2
 		else
-			printf '  Blacklist: %b(none)%b\n' "$_D" "$_N" >&2
+			printf '  Exclude: %b(none)%b\n' "$_D" "$_N" >&2
 		fi
-		printf '  %b[e]%b Edit blacklist\n' "$_Y" "$_N" >&2
+		printf '  %b[e]%b Edit exclude\n' "$_Y" "$_N" >&2
 
 		printf '\n' >&2
 		printf '  Sink name: %b%s%b\n' "$_B" "$SINK_NAME" "$_N" >&2
@@ -1779,32 +1779,32 @@ tui_menu_config() {
 			;;
 		w | W)
 			tui_show_cursor
-			printf '\n  Whitelist (comma-separated, empty to clear): ' >&2
+			printf '\n  Include (comma-separated, empty to clear): ' >&2
 			local new_val=""
 			IFS= read -r new_val </dev/tty 2>/dev/null || true
 			tui_hide_cursor
 			if [[ -z "$new_val" ]]; then
-				WHITELIST=()
-				_tui_push_msg "Whitelist cleared"
+				INCLUDE=()
+				_tui_push_msg "Include cleared"
 			else
-				IFS=',' read -ra WHITELIST <<<"$new_val"
-				BLACKLIST=()
-				_tui_push_msg "Whitelist → ${WHITELIST[*]}"
+				IFS=',' read -ra INCLUDE <<<"$new_val"
+				EXCLUDE=()
+				_tui_push_msg "Include → ${INCLUDE[*]}"
 			fi
 			;;
 		e | E)
 			tui_show_cursor
-			printf '\n  Blacklist (comma-separated, empty to clear): ' >&2
+			printf '\n  Exclude (comma-separated, empty to clear): ' >&2
 			local new_val=""
 			IFS= read -r new_val </dev/tty 2>/dev/null || true
 			tui_hide_cursor
 			if [[ -z "$new_val" ]]; then
-				BLACKLIST=()
-				_tui_push_msg "Blacklist cleared"
+				EXCLUDE=()
+				_tui_push_msg "Exclude cleared"
 			else
-				IFS=',' read -ra BLACKLIST <<<"$new_val"
-				WHITELIST=()
-				_tui_push_msg "Blacklist → ${BLACKLIST[*]}"
+				IFS=',' read -ra EXCLUDE <<<"$new_val"
+				INCLUDE=()
+				_tui_push_msg "Exclude → ${EXCLUDE[*]}"
 			fi
 			;;
 		b | B | ESC | q | Q)
@@ -1987,10 +1987,10 @@ main() {
 	log "Description:   ${SINK_DESCRIPTION}"
 	log "Auto-capture:  ${AUTO_CAPTURE}"
 	log "Mute local:    ${MUTE_LOCAL}"
-	if ((${#WHITELIST[@]} > 0)); then
-		log "Whitelist:     ${WHITELIST[*]}"
-	elif ((${#BLACKLIST[@]} > 0)); then
-		log "Blacklist:     ${BLACKLIST[*]}"
+	if ((${#INCLUDE[@]} > 0)); then
+		log "Include:     ${INCLUDE[*]}"
+	elif ((${#EXCLUDE[@]} > 0)); then
+		log "Exclude:     ${EXCLUDE[*]}"
 	else
 		log "Filter:        (none — all streams)"
 	fi
