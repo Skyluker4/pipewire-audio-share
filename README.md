@@ -4,7 +4,7 @@ A PipeWire virtual sink manager that routes application audio into a
 capture-ready sink for streaming software like [Sunshine], [OBS], or any
 program that can record from a PulseAudio/PipeWire monitor source.
 
-Your default speakers keep working — audio is *duplicated* into the virtual
+Your default speakers keep working — audio is _duplicated_ into the virtual
 sink rather than redirected, unless you explicitly ask for silent local
 playback with `--mute-local`.
 
@@ -15,18 +15,18 @@ playback with `--mute-local`.
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| **Virtual null sink** | Creates a dedicated PipeWire sink with monitor ports that capture software can read |
-| **Auto-capture** | Automatically routes every new audio stream into the sink (on by default) |
-| **Whitelist / Blacklist** | Case-insensitive substring matching against application and node names |
-| **Mute local** | Optionally silence captured streams on your speakers — restored on exit |
-| **Multiple instances** | Run several sinks simultaneously with independent filters and options |
-| **Instance management** | `--status`, `--stop`, `--stop-all` for controlling background instances |
-| **Stale recovery** | Crashed instances leave no orphaned sinks — automatically cleaned up |
-| **Interactive TUI** | Full terminal UI for live stream toggling, volume control, output routing, and config editing |
-| **Default-sink aware** | Tracks the *current* default sink dynamically, not just the one at startup |
-| **Peer-aware muting** | Multiple `--mute-local` instances won't fight over the same stream |
+| Feature                   | Description                                                                                   |
+| ------------------------- | --------------------------------------------------------------------------------------------- |
+| **Virtual null sink**     | Creates a dedicated PipeWire sink with monitor ports that capture software can read           |
+| **Auto-capture**          | Automatically routes every new audio stream into the sink (on by default)                     |
+| **Whitelist / Blacklist** | Case-insensitive substring matching against application and node names                        |
+| **Mute local**            | Optionally silence captured streams on your speakers — restored on exit                       |
+| **Multiple instances**    | Run several sinks simultaneously with independent filters and options                         |
+| **Instance management**   | `--status`, `--stop`, `--stop-all` for controlling background instances                       |
+| **Stale recovery**        | Crashed instances leave no orphaned sinks — automatically cleaned up                          |
+| **Interactive TUI**       | Full terminal UI for live stream toggling, volume control, output routing, and config editing |
+| **Default-sink aware**    | Tracks the _current_ default sink dynamically, not just the one at startup                    |
+| **Peer-aware muting**     | Multiple `--mute-local` instances won't fight over the same stream                            |
 
 ---
 
@@ -34,7 +34,7 @@ playback with `--mute-local`.
 
 - **PipeWire** with **PipeWire-Pulse** (the PulseAudio compatibility layer)
 - **WirePlumber** (or another PipeWire session manager)
-- Standard PipeWire CLI tools:
+- Standard PipeWire command-line tools:
   - `pw-link`
   - `pw-dump`
   - `pactl`
@@ -98,7 +98,7 @@ restored to their original routing.
 
 ## Usage
 
-```
+```text
 audio-share.sh [OPTIONS]
 audio-share.sh -i [OPTIONS]
 audio-share.sh --status
@@ -108,27 +108,27 @@ audio-share.sh --stop-all
 
 ### Options
 
-| Flag | Description | Default |
-|---|---|---|
-| `-n`, `--sink-name NAME` | PipeWire sink name | `audio_share` |
-| `-d`, `--description DESC` | Human-readable description shown in pavucontrol etc. | `Audio Share` |
-| `-a`, `--auto-capture` | Capture new streams as they appear | **on** |
-| `-A`, `--no-auto-capture` | Only capture streams present at startup | |
-| `-w`, `--whitelist APPS` | Comma-separated patterns — only matching streams are captured | |
-| `-b`, `--blacklist APPS` | Comma-separated patterns — matching streams are excluded | |
-| `-m`, `--mute-local` | Don't play captured audio on the default output | off |
-| `-p`, `--poll-interval SECS` | How often to scan for changes | `2` |
-| `-i`, `--interactive` | Launch interactive TUI (requires a terminal) | |
-| `-v`, `--verbose` | Print debug-level log output | |
-| `-h`, `--help` | Show built-in help text | |
+| Flag                         | Description                                                   | Default       |
+| ---------------------------- | ------------------------------------------------------------- | ------------- |
+| `-n`, `--sink-name NAME`     | PipeWire sink name                                            | `audio_share` |
+| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc.          | `Audio Share` |
+| `-a`, `--auto-capture`       | Capture new streams as they appear                            | **on**        |
+| `-A`, `--no-auto-capture`    | Only capture streams present at startup                       |               |
+| `-w`, `--whitelist APPS`     | Comma-separated patterns — only matching streams are captured |               |
+| `-b`, `--blacklist APPS`     | Comma-separated patterns — matching streams are excluded      |               |
+| `-m`, `--mute-local`         | Don't play captured audio on the default output               | off           |
+| `-p`, `--poll-interval SECS` | How often to scan for changes                                 | `2`           |
+| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)                  |               |
+| `-v`, `--verbose`            | Print debug-level log output                                  |               |
+| `-h`, `--help`               | Show built-in help text                                       |               |
 
 ### Management commands
 
-| Command | Description |
-|---|---|
-| `--status` | List all running audio-share instances with PID, module ID, and status |
-| `--stop NAME` | Gracefully stop the instance managing the named sink |
-| `--stop-all` | Stop every running instance |
+| Command       | Description                                                            |
+| ------------- | ---------------------------------------------------------------------- |
+| `--status`    | List all running audio-share instances with PID, module ID, and status |
+| `--stop NAME` | Gracefully stop the instance managing the named sink                   |
+| `--stop-all`  | Stop every running instance                                            |
 
 ### Pattern matching
 
@@ -157,7 +157,7 @@ your scrollback. Background monitoring continues while you navigate menus.
 
 ### Menu structure
 
-```
+```text
 Main ─┬─ [s] Streams ── toggle capture on individual applications
       ├─ [v] Volume ─── adjust sink and per-stream volume, mute/unmute
       ├─ [o] Output ─── switch default hardware sink, toggle mute-local
@@ -168,14 +168,14 @@ Main ─┬─ [s] Streams ── toggle capture on individual applications
 
 ### Streams menu
 
-| Key | Action |
-|---|---|
-| **↑ / ↓** | Navigate the stream list |
+| Key               | Action                                |
+| ----------------- | ------------------------------------- |
+| **↑ / ↓**         | Navigate the stream list              |
 | **Space / Enter** | Toggle capture on the selected stream |
-| **1–9** | Quick-toggle by number |
-| **a** | Capture all streams |
-| **r** | Release all streams |
-| **b / Esc** | Back to main menu |
+| **1–9**           | Quick-toggle by number                |
+| **a**             | Capture all streams                   |
+| **r**             | Release all streams                   |
+| **b / Esc**       | Back to main menu                     |
 
 Manually toggled streams override the whitelist/blacklist. A manually
 removed stream won't be re-captured by auto-capture, and a manually added
@@ -183,35 +183,35 @@ stream ignores filters.
 
 ### Volume menu
 
-| Key | Action |
-|---|---|
-| **↑ / ↓** | Select the virtual sink or a captured stream |
-| **← / →** | Adjust volume by ±5% |
-| **[ / ]** | Fine adjustment by ±1% |
-| **0** | Toggle mute |
-| **b / Esc** | Back |
+| Key         | Action                                       |
+| ----------- | -------------------------------------------- |
+| **↑ / ↓**   | Select the virtual sink or a captured stream |
+| **← / →**   | Adjust volume by ±5%                         |
+| **[ / ]**   | Fine adjustment by ±1%                       |
+| **0**       | Toggle mute                                  |
+| **b / Esc** | Back                                         |
 
 Volume bars are colour-coded: green ≤60%, yellow 61–85%, red >85%.
 
 ### Output menu
 
-| Key | Action |
-|---|---|
-| **↑ / ↓** | Navigate available hardware sinks |
-| **Enter / 1–9** | Set as default output |
-| **m** | Toggle mute-local (live — streams are moved/restored immediately) |
-| **b / Esc** | Back |
+| Key             | Action                                                            |
+| --------------- | ----------------------------------------------------------------- |
+| **↑ / ↓**       | Navigate available hardware sinks                                 |
+| **Enter / 1–9** | Set as default output                                             |
+| **m**           | Toggle mute-local (live — streams are moved/restored immediately) |
+| **b / Esc**     | Back                                                              |
 
 ### Config menu
 
-| Key | Action |
-|---|---|
-| **a** | Toggle auto-capture |
-| **m** | Toggle mute-local |
-| **p** | Change poll interval (prompts for input) |
-| **w** | Edit whitelist (prompts for comma-separated patterns) |
-| **e** | Edit blacklist (prompts for comma-separated patterns) |
-| **b / Esc** | Back |
+| Key         | Action                                                |
+| ----------- | ----------------------------------------------------- |
+| **a**       | Toggle auto-capture                                   |
+| **m**       | Toggle mute-local                                     |
+| **p**       | Change poll interval (prompts for input)              |
+| **w**       | Edit whitelist (prompts for comma-separated patterns) |
+| **e**       | Edit blacklist (prompts for comma-separated patterns) |
+| **b / Esc** | Back                                                  |
 
 ---
 
@@ -254,7 +254,7 @@ instance's sink.
 
 ### Architecture
 
-```
+```text
 ┌──────────────┐     pw-link (supplementary)     ┌──────────────────┐
 │  Application ├──────────────────────────────────▸ audio_share      │
 │  (Firefox)   ├──┐                               │  (null sink)     │
@@ -271,13 +271,13 @@ instance's sink.
 1. **`pactl load-module module-null-sink`** creates a virtual sink with
    playback (input) ports and monitor (output) ports.
 
-2. For each matching audio stream, **`pw-link`** creates a *supplementary*
+2. For each matching audio stream, **`pw-link`** creates a _supplementary_
    link from the stream's output ports to the virtual sink's playback
    ports. The existing WirePlumber-managed link to your speakers stays
    in place — audio plays on both.
 
 3. If **`--mute-local`** is given, **`pactl move-sink-input`** is used
-   instead, which tells WirePlumber to route the stream *exclusively* to
+   instead, which tells WirePlumber to route the stream _exclusively_ to
    the virtual sink. This cooperates with WirePlumber rather than fighting
    it, so there are no re-linking loops.
 
@@ -287,7 +287,7 @@ instance's sink.
    - Re-evaluates skipped streams in case a peer instance released them
 
 5. On **exit** (Ctrl+C, SIGTERM, SIGHUP), the cleanup handler:
-   - Restores muted streams to the *current* default sink (not the startup one)
+   - Restores muted streams to the _current_ default sink (not the startup one)
    - Unloads the null-sink module
    - Removes the PID file
 
@@ -299,7 +299,7 @@ running, cleanup will restore streams to the correct device.
 
 ### Signal handling
 
-```
+```text
 SIGTERM / SIGINT / SIGHUP  →  exit 0  →  EXIT trap  →  cleanup()
 ```
 
@@ -326,13 +326,13 @@ streaming server compatible with Moonlight.
 2. In the Sunshine web UI (**Configuration → Audio**), set the
    **Virtual Sink** to:
 
-   ```
+   ```text
    sink:audio_share
    ```
 
    Or if Sunshine asks for a **monitor source**:
 
-   ```
+   ```text
    audio_share.monitor
    ```
 
@@ -357,9 +357,9 @@ streaming server compatible with Moonlight.
 
 ### pavucontrol / qpwgraph
 
-The virtual sink appears in **pavucontrol** under the *Output Devices* tab
+The virtual sink appears in **pavucontrol** under the _Output Devices_ tab
 with the description you passed to `-d`. Its monitor source appears under
-*Input Devices*.
+_Input Devices_.
 
 In **qpwgraph**, you'll see the additional links drawn from application
 output ports to the virtual sink's input ports.
@@ -368,10 +368,10 @@ output ports to the virtual sink's input ports.
 
 ## Files
 
-| Path | Purpose |
-|---|---|
-| `audio-share.sh` | The entire tool — single self-contained script |
-| `$XDG_RUNTIME_DIR/audio-share/*.pid` | Per-instance PID files (`PID:MODULE_ID`) |
+| Path                                 | Purpose                                        |
+| ------------------------------------ | ---------------------------------------------- |
+| `audio-share.sh`                     | The entire tool — single self-contained script |
+| `$XDG_RUNTIME_DIR/audio-share/*.pid` | Per-instance PID files (`PID:MODULE_ID`)       |
 
 ---
 
@@ -394,7 +394,7 @@ If the script was killed with SIGKILL (or the system crashed), the null
 sink module may still be loaded. The next start auto-detects this via the
 PID file and unloads the orphaned module:
 
-```
+```text
 WARN: Found stale PID file for 'audio_share' (PID 12345 is dead)
 Unloading orphaned module 536870916 from previous crash
 ```

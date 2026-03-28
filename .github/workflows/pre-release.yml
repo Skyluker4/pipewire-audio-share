@@ -19,10 +19,14 @@ jobs:
           persist-credentials: false
 
       - name: Pre-release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: latest
-          name: Development Build
-          prerelease: true
-          generate_release_notes: true
-          files: audio-share.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --title "Development Build" \
+            --prerelease \
+            --generate-notes \
+            --target "$GITHUB_SHA" \
+            audio-share.sh
