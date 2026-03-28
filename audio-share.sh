@@ -28,6 +28,7 @@ AUTO_CAPTURE=true
 MUTE_LOCAL=false
 POLL_INTERVAL=2
 VERBOSE=false
+INTERACTIVE=false
 declare -a WHITELIST=()
 declare -a BLACKLIST=()
 
@@ -40,6 +41,10 @@ RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/audio-share"
 declare -A CAPTURED=()          # node_name → "1"  (streams we are managing)
 declare -A SKIPPED=()           # node_name → "1"  (streams we skipped, e.g. peer-owned)
 declare -A MOVED_INPUTS=()      # pactl_index → original_sink  (for mute-local restore)
+declare -A MANUAL_ADD=()        # node_name → "1"  (user explicitly added via TUI)
+declare -A MANUAL_REMOVE=()     # node_name → "1"  (user explicitly removed via TUI)
+TUI_ACTIVE=false                # true while the interactive TUI owns the screen
+declare -a TUI_MESSAGES=()      # ring buffer of recent warnings/errors for TUI
 
 # ─── colours / logging ──────────────────────────────────────────────────────
 
@@ -52,10 +57,36 @@ fi
 
 _ts()   { date +%H:%M:%S; }
 _tag()  { printf '%b%s%b' "$_D" "$SINK_NAME" "$_N"; }
-log()   { printf '%b[%s]%b %b(%s)%b %s\n' "$_G" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2; }
-warn()  { printf '%b[%s] WARN:%b %b(%s)%b %s\n' "$_Y" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2; }
-err()   { printf '%b[%s] ERROR:%b %b(%s)%b %s\n' "$_R" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2; }
-debug() { [[ "$VERBOSE" == true ]] && printf '%b[%s] dbg:%b %b(%s)%b %s\n' "$_C" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2 || true; }
+
+_tui_push_msg() {
+    TUI_MESSAGES+=("$*")
+    while (( ${#TUI_MESSAGES[@]} > 5 )); do
+        TUI_MESSAGES=("${TUI_MESSAGES[@]:1}")
+    done
+}
+
+log() {
+    [[ "$TUI_ACTIVE" == true ]] && return
+    printf '%b[%s]%b %b(%s)%b %s\n' "$_G" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2
+}
+warn() {
+    if [[ "$TUI_ACTIVE" == true ]]; then
+        _tui_push_msg "WARN: $*"
+        return
+    fi
+    printf '%b[%s] WARN:%b %b(%s)%b %s\n' "$_Y" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2
+}
+err() {
+    if [[ "$TUI_ACTIVE" == true ]]; then
+        _tui_push_msg "ERROR: $*"
+        return
+    fi
+    printf '%b[%s] ERROR:%b %b(%s)%b %s\n' "$_R" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2
+}
+debug() {
+    [[ "$TUI_ACTIVE" == true ]] && return
+    [[ "$VERBOSE" == true ]] && printf '%b[%s] dbg:%b %b(%s)%b %s\n' "$_C" "$(_ts)" "$_N" "$_D" "$SINK_NAME" "$_N" "$*" >&2 || true
+}
 
 die() { err "$@"; exit 1; }
 
@@ -67,6 +98,7 @@ audio-share — route application audio into a virtual PipeWire sink
 
 USAGE
     audio-share.sh [OPTIONS]
+    audio-share.sh -i [OPTIONS]
     audio-share.sh --status
     audio-share.sh --stop NAME
     audio-share.sh --stop-all
@@ -86,6 +118,7 @@ OPTIONS
                                   (moves streams exclusively to the virtual sink)
 
     -p, --poll-interval SECS      How often to scan for changes (default: 2)
+    -i, --interactive             Launch interactive TUI (requires a terminal)
     -v, --verbose                 Print extra debug output
     -h, --help                    Show this help
 
@@ -144,6 +177,10 @@ EXAMPLES
     audio-share.sh --status
     audio-share.sh --stop sunshine_audio
     audio-share.sh --stop-all
+
+    # interactive mode — live TUI for managing streams, volume, etc.
+    audio-share.sh -i
+    audio-share.sh -i -n sunshine_audio --whitelist "firefox,mpv"
 EOF
 }
 
@@ -166,6 +203,7 @@ parse_args() {
             -b|--blacklist)      IFS=',' read -ra BLACKLIST <<< "$2"; shift 2 ;;
             -m|--mute-local)     MUTE_LOCAL=true;           shift   ;;
             -p|--poll-interval)  POLL_INTERVAL="$2";        shift 2 ;;
+            -i|--interactive)    INTERACTIVE=true;           shift   ;;
             -v|--verbose)        VERBOSE=true;              shift   ;;
             -h|--help)           usage; exit 0 ;;
             *)                   die "Unknown option: $1 (try --help)" ;;
@@ -175,6 +213,9 @@ parse_args() {
     if [[ "$ACTION" == "run" ]]; then
         if (( ${#WHITELIST[@]} > 0 && ${#BLACKLIST[@]} > 0 )); then
             die "Cannot use --whitelist and --blacklist together"
+        fi
+        if [[ "$INTERACTIVE" == true ]] && ! [[ -t 0 && -t 2 ]]; then
+            die "Interactive mode requires a terminal (stdin and stderr must be TTY)"
         fi
     fi
 }
@@ -765,6 +806,17 @@ scan_new_streams() {
         # Already tracked (captured or previously skipped)?
         [[ -v "CAPTURED[$node_name]" ]] && continue
         [[ -v "SKIPPED[$node_name]" ]] && continue
+        # User explicitly removed this stream via interactive menu?
+        [[ -v "MANUAL_REMOVE[$node_name]" ]] && continue
+
+        # Manual add overrides filter
+        if [[ -v "MANUAL_ADD[$node_name]" ]]; then
+            log "Auto-capturing manually added stream: ${_B}${app_name:-$node_name}${_N}"
+            if ! capture_stream "$node_name" "$app_name"; then
+                SKIPPED["$node_name"]=1
+            fi
+            continue
+        fi
 
         if stream_matches_filter "$node_name" "$app_name"; then
             log "New stream: ${_B}${app_name:-$node_name}${_N}  (${node_name})"
@@ -845,6 +897,13 @@ cleanup() {
     [[ "$CLEANUP_DONE" == true ]] && return
     CLEANUP_DONE=true
 
+    # Leave TUI alternate screen before printing cleanup messages
+    if [[ "$TUI_ACTIVE" == true ]]; then
+        printf '\033[?25h' >&2
+        printf '\033[?1049l' >&2
+        TUI_ACTIVE=false
+    fi
+
     log "Shutting down …"
 
     # Restore muted streams before removing the sink
@@ -892,6 +951,869 @@ monitor_loop() {
         verify_existing_links
         sleep "$POLL_INTERVAL" || true
     done
+}
+
+# ─── interactive TUI ────────────────────────────────────────────────────────
+# Only used when -i/--interactive is passed and stdin/stderr are a TTY.
+
+# ── TUI terminal helpers ──
+
+tui_init() {
+    printf '\033[?1049h' >&2    # enter alternate screen buffer
+    printf '\033[?25l' >&2      # hide cursor
+    TUI_ACTIVE=true
+}
+
+tui_fini() {
+    printf '\033[?25h' >&2      # show cursor
+    printf '\033[?1049l' >&2    # leave alternate screen buffer
+    TUI_ACTIVE=false
+}
+
+tui_clear()  { printf '\033[2J\033[H' >&2; }
+tui_goto()   { printf '\033[%d;%dH' "$1" "$2" >&2; }   # row col (1-based)
+tui_el()     { printf '\033[K' >&2; }                    # erase to end of line
+tui_show_cursor() { printf '\033[?25h' >&2; }
+tui_hide_cursor() { printf '\033[?25l' >&2; }
+
+tui_size() {
+    TERM_COLS=$(tput cols  2>/dev/null || echo 80)
+    TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
+}
+
+# Read a single key press.  Returns the key as a string via stdout.
+# Special keys: UP DOWN LEFT RIGHT ESC ENTER BACKSPACE
+# Returns 1 on timeout.
+tui_read_key() {
+    local timeout="${1:-0}"
+    local key=""
+    if (( timeout > 0 )); then
+        IFS= read -rsn1 -t "$timeout" key 2>/dev/null || return 1
+    else
+        IFS= read -rsn1 key 2>/dev/null || return 1
+    fi
+    if [[ "$key" == $'\033' ]]; then
+        local seq="" code=""
+        IFS= read -rsn1 -t 0.05 seq 2>/dev/null || true
+        if [[ "$seq" == "[" ]]; then
+            IFS= read -rsn1 -t 0.05 code 2>/dev/null || true
+            case "$code" in
+                A) printf 'UP';    return 0 ;;
+                B) printf 'DOWN';  return 0 ;;
+                C) printf 'RIGHT'; return 0 ;;
+                D) printf 'LEFT';  return 0 ;;
+            esac
+        fi
+        printf 'ESC'; return 0
+    elif [[ "$key" == "" ]]; then
+        printf 'ENTER'; return 0
+    elif [[ "$key" == $'\177' || "$key" == $'\b' ]]; then
+        printf 'BACKSPACE'; return 0
+    fi
+    printf '%s' "$key"
+}
+
+# ── TUI drawing primitives ──
+
+# Print a coloured header line.
+tui_header() {
+    local title="$1"
+    tui_size
+    printf '%b  audio-share' "$_B" >&2
+    [[ -n "$title" ]] && printf ' ▸ %s' "$title" >&2
+    printf '%b\n' "$_N" >&2
+    local i
+    printf '  ' >&2
+    for (( i=0; i<TERM_COLS-4; i++ )); do printf '━' >&2; done
+    printf '\n' >&2
+}
+
+# Print a hotkey hint: tui_hint "key" "label"
+tui_hint() {
+    printf '  %b[%s]%b %s' "$_Y" "$1" "$_N" "$2" >&2
+}
+
+# Print a horizontal rule.
+tui_rule() {
+    tui_size
+    printf '  ' >&2
+    local i; for (( i=0; i<TERM_COLS-4; i++ )); do printf '─' >&2; done
+    printf '\n' >&2
+}
+
+# Render a volume bar.  Usage: tui_volume_bar <percent> [width]
+tui_volume_bar() {
+    local pct="${1:-0}" width="${2:-20}"
+    (( pct < 0 )) && pct=0
+    local filled=$(( pct * width / 100 ))
+    (( filled > width )) && filled=$width
+    local empty=$(( width - filled ))
+
+    local color="$_G"
+    (( pct > 60 )) && color="$_Y"
+    (( pct > 85 )) && color="$_R"
+
+    printf '%b' "$color" >&2
+    local i
+    for (( i=0; i<filled; i++ )); do printf '█' >&2; done
+    printf '%b' "$_D" >&2
+    for (( i=0; i<empty; i++ )); do printf '░' >&2; done
+    printf '%b %3d%%%b' "$color" "$pct" "$_N" >&2
+}
+
+# Show recent TUI messages (warnings/errors) at the bottom.
+tui_show_messages() {
+    if (( ${#TUI_MESSAGES[@]} > 0 )); then
+        printf '\n' >&2
+        local msg
+        for msg in "${TUI_MESSAGES[@]}"; do
+            printf '  %b%s%b\n' "$_Y" "$msg" "$_N" >&2
+        done
+    fi
+}
+
+# ── TUI data helpers ──
+
+# Get volume percentage for a pactl sink (first channel).
+tui_get_sink_volume() {
+    local sink="$1"
+    pactl get-sink-volume "$sink" 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i ~ /%/) {gsub(/%/,"",$i); print $i+0; exit}}'
+}
+
+# Get mute state for a pactl sink → "yes" or "no".
+tui_get_sink_mute() {
+    pactl get-sink-mute "$1" 2>/dev/null | awk '{print $2}'
+}
+
+# Get volume percentage for a sink-input by pactl index.
+tui_get_input_volume_by_idx() {
+    local target_idx="$1"
+    pactl list sink-inputs 2>/dev/null | awk -v idx="$target_idx" '
+        /^Sink Input #/ { cur=$3; gsub(/#/,"",cur); vol="" }
+        /^\tVolume:/ {
+            for(i=1;i<=NF;i++) if($i ~ /%/) {gsub(/%/,"",$i); vol=$i+0; break}
+        }
+        /^\tMute:/ && cur==idx { mute=$2 }
+        /node\.name =/ && cur==idx { if(vol!="") print vol; exit }
+    '
+}
+
+# Get mute state for a sink-input by pactl index → "yes" or "no".
+tui_get_input_mute_by_idx() {
+    local target_idx="$1"
+    pactl list sink-inputs 2>/dev/null | awk -v idx="$target_idx" '
+        /^Sink Input #/ { cur=$3; gsub(/#/,"",cur); mute="" }
+        /^\tMute:/ && cur==idx { print $2; exit }
+    '
+}
+
+# Get the first pactl sink-input index for a given node_name.
+tui_get_input_idx() {
+    local target="$1"
+    pactl list sink-inputs 2>/dev/null | awk -v t="$target" '
+        /^Sink Input #/ { idx=$3; gsub(/#/,"",idx) }
+        /node\.name =/ {
+            val=$0; gsub(/.*= "/,"",val); gsub(/".*/,"",val)
+            if(val==t) { print idx; exit }
+        }
+    '
+}
+
+# Collect all audio streams as an indexed bash array of tab-separated records:
+#   node_name \t app_name \t status
+# Status: captured | available | filtered | removed | skipped
+# Sets: _TUI_STREAMS=( ... ) and _TUI_STREAM_COUNT
+declare -a _TUI_STREAMS=()
+_TUI_STREAM_COUNT=0
+
+tui_refresh_streams() {
+    _TUI_STREAMS=()
+    _TUI_STREAM_COUNT=0
+    while IFS= read -r obj; do
+        [[ -z "$obj" ]] && continue
+        local nn an
+        nn=$(jq -r '.node_name // empty' <<< "$obj")
+        an=$(jq -r '.app_name  // empty' <<< "$obj")
+        [[ -z "$nn" ]] && continue
+        [[ "$nn" == "${SINK_NAME}"* ]] && continue
+
+        local st="available"
+        if   [[ -v "CAPTURED[$nn]" ]];       then st="captured"
+        elif [[ -v "MANUAL_REMOVE[$nn]" ]];  then st="removed"
+        elif [[ -v "SKIPPED[$nn]" ]];        then st="skipped"
+        elif ! stream_matches_filter "$nn" "$an"; then st="filtered"
+        fi
+
+        _TUI_STREAMS+=( "${nn}	${an}	${st}" )
+        (( ++_TUI_STREAM_COUNT ))
+    done < <(get_audio_streams)
+}
+
+# Collect all hardware sinks.  Sets: _TUI_SINKS=( "name \t description" ... )
+declare -a _TUI_SINKS=()
+
+tui_refresh_sinks() {
+    _TUI_SINKS=()
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        _TUI_SINKS+=( "$line" )
+    done < <(pactl list sinks 2>/dev/null | awk '
+        /^\tName:/ { name=$2 }
+        /^\tDescription:/ {
+            desc=$0; gsub(/^\tDescription: /,"",desc)
+            print name "\t" desc
+        }
+    ')
+}
+
+# ── TUI menu: Streams ──
+
+tui_menu_streams() {
+    local sel=0
+    while true; do
+        tui_refresh_streams
+        tui_clear
+        tui_header "Streams"
+        printf '\n' >&2
+
+        if (( _TUI_STREAM_COUNT == 0 )); then
+            printf '  %b(no audio streams playing)%b\n' "$_D" "$_N" >&2
+        else
+            local i
+            for (( i=0; i<_TUI_STREAM_COUNT; i++ )); do
+                local rec="${_TUI_STREAMS[$i]}"
+                local nn an st
+                IFS=$'\t' read -r nn an st <<< "$rec"
+                local label="${an:-$nn}"
+
+                local marker color suffix
+                case "$st" in
+                    captured) marker="●"; color="$_G"; suffix="" ;;
+                    available) marker="○"; color="$_N"; suffix="" ;;
+                    filtered) marker="○"; color="$_D"; suffix=" (filtered)" ;;
+                    removed)  marker="⊘"; color="$_D"; suffix=" (manual remove)" ;;
+                    skipped)  marker="⊘"; color="$_Y"; suffix=" (peer-owned)" ;;
+                    *)        marker="?"; color="$_D"; suffix="" ;;
+                esac
+
+                local ptr="  "
+                (( i == sel )) && ptr="▸ "
+
+                printf '  %s%b%s %d. %-40s%s%b\n' \
+                    "$ptr" "$color" "$marker" $((i+1)) "$label" "$suffix" "$_N" >&2
+            done
+        fi
+
+        printf '\n' >&2
+        tui_rule
+        tui_hint "↑↓" "navigate"
+        tui_hint "Space" "toggle"
+        tui_hint "a" "add all"
+        tui_hint "r" "release all"
+        printf '\n' >&2
+        tui_hint "b/Esc" "back"
+        printf '\n' >&2
+        tui_show_messages
+
+        local key
+        key=$(tui_read_key "$POLL_INTERVAL") || {
+            [[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+            verify_existing_links
+            continue
+        }
+
+        case "$key" in
+            UP)
+                (( sel > 0 )) && (( sel-- ))
+                ;;
+            DOWN)
+                (( sel < _TUI_STREAM_COUNT - 1 )) && (( sel++ )) || true
+                ;;
+            ' '|ENTER)
+                (( _TUI_STREAM_COUNT > 0 )) || continue
+                local rec="${_TUI_STREAMS[$sel]}"
+                local nn an st
+                IFS=$'\t' read -r nn an st <<< "$rec"
+                if [[ "$st" == "captured" ]]; then
+                    release_stream "$nn"
+                    MANUAL_REMOVE["$nn"]=1
+                    unset "MANUAL_ADD[$nn]"
+                    _tui_push_msg "Released: ${an:-$nn}"
+                else
+                    unset "MANUAL_REMOVE[$nn]"
+                    unset "SKIPPED[$nn]"
+                    MANUAL_ADD["$nn"]=1
+                    capture_stream "$nn" "${an:-}" || _tui_push_msg "Could not capture: ${an:-$nn}"
+                fi
+                ;;
+            [1-9])
+                local idx=$(( key - 1 ))
+                if (( idx < _TUI_STREAM_COUNT )); then
+                    sel=$idx
+                    local rec="${_TUI_STREAMS[$sel]}"
+                    local nn an st
+                    IFS=$'\t' read -r nn an st <<< "$rec"
+                    if [[ "$st" == "captured" ]]; then
+                        release_stream "$nn"
+                        MANUAL_REMOVE["$nn"]=1
+                        unset "MANUAL_ADD[$nn]"
+                    else
+                        unset "MANUAL_REMOVE[$nn]"
+                        unset "SKIPPED[$nn]"
+                        MANUAL_ADD["$nn"]=1
+                        capture_stream "$nn" "${an:-}" || true
+                    fi
+                fi
+                ;;
+            a|A)
+                tui_refresh_streams
+                local i
+                for (( i=0; i<_TUI_STREAM_COUNT; i++ )); do
+                    local rec="${_TUI_STREAMS[$i]}"
+                    local nn an st
+                    IFS=$'\t' read -r nn an st <<< "$rec"
+                    if [[ "$st" != "captured" ]]; then
+                        unset "MANUAL_REMOVE[$nn]"
+                        unset "SKIPPED[$nn]"
+                        MANUAL_ADD["$nn"]=1
+                        capture_stream "$nn" "${an:-}" || true
+                    fi
+                done
+                _tui_push_msg "Added all streams"
+                ;;
+            r|R)
+                for nn in "${!CAPTURED[@]}"; do
+                    release_stream "$nn"
+                    MANUAL_REMOVE["$nn"]=1
+                    unset "MANUAL_ADD[$nn]"
+                done
+                _tui_push_msg "Released all streams"
+                ;;
+            b|B|ESC|q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+# ── TUI menu: Volume ──
+
+tui_menu_volume() {
+    local sel=0   # 0 = sink, 1+ = captured streams
+    while true; do
+        tui_clear
+        tui_header "Volume"
+        printf '\n' >&2
+
+        # Build list: first entry is the virtual sink, then captured streams
+        local -a vol_names=() vol_labels=() vol_types=()  # type: sink | input
+        local -a vol_idxs=()   # pactl index for inputs, sink name for sinks
+
+        vol_names+=("$SINK_NAME")
+        vol_labels+=("Sink: ${SINK_DESCRIPTION}")
+        vol_types+=("sink")
+        vol_idxs+=("$SINK_NAME")
+
+        for nn in "${!CAPTURED[@]}"; do
+            local an="" idx=""
+            # Get a display name from the current stream data
+            while IFS= read -r obj; do
+                [[ -z "$obj" ]] && continue
+                local n a
+                n=$(jq -r '.node_name // empty' <<< "$obj")
+                a=$(jq -r '.app_name  // empty' <<< "$obj")
+                if [[ "$n" == "$nn" ]]; then
+                    an="$a"; break
+                fi
+            done < <(get_audio_streams)
+            idx=$(tui_get_input_idx "$nn")
+            [[ -z "$idx" ]] && continue
+            vol_names+=("$nn")
+            vol_labels+=("${an:-$nn}")
+            vol_types+=("input")
+            vol_idxs+=("$idx")
+        done
+
+        local total=${#vol_names[@]}
+        (( sel >= total )) && sel=$(( total - 1 ))
+        (( sel < 0 )) && sel=0
+
+        local i
+        for (( i=0; i<total; i++ )); do
+            local ptr="  "
+            (( i == sel )) && ptr="▸ "
+
+            local pct=0 muted="no"
+            if [[ "${vol_types[$i]}" == "sink" ]]; then
+                pct=$(tui_get_sink_volume "${vol_idxs[$i]}")
+                muted=$(tui_get_sink_mute "${vol_idxs[$i]}")
+            else
+                pct=$(tui_get_input_volume_by_idx "${vol_idxs[$i]}")
+                muted=$(tui_get_input_mute_by_idx "${vol_idxs[$i]}")
+            fi
+            pct="${pct:-0}"
+            muted="${muted:-no}"
+
+            local label="${vol_labels[$i]}"
+            local mute_tag=""
+            [[ "$muted" == "yes" ]] && mute_tag=" ${_R}[MUTED]${_N}"
+
+            printf '  %s%b%s%b%s\n' "$ptr" "$_B" "$label" "$_N" "$mute_tag" >&2
+            printf '    ' >&2
+            tui_volume_bar "$pct" 24
+            printf '\n' >&2
+        done
+
+        printf '\n' >&2
+        tui_rule
+        tui_hint "↑↓" "select"
+        tui_hint "←→" "±5%%"
+        tui_hint "[/]" "±1%%"
+        printf '\n' >&2
+        tui_hint "0" "mute/unmute"
+        tui_hint "b/Esc" "back"
+        printf '\n' >&2
+        tui_show_messages
+
+        local key
+        key=$(tui_read_key "$POLL_INTERVAL") || {
+            [[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+            verify_existing_links
+            continue
+        }
+
+        case "$key" in
+            UP)    (( sel > 0 )) && (( sel-- )) ;;
+            DOWN)  (( sel < total - 1 )) && (( sel++ )) || true ;;
+            RIGHT)
+                if [[ "${vol_types[$sel]}" == "sink" ]]; then
+                    pactl set-sink-volume "${vol_idxs[$sel]}" +5% 2>/dev/null
+                else
+                    pactl set-sink-input-volume "${vol_idxs[$sel]}" +5% 2>/dev/null
+                fi
+                ;;
+            LEFT)
+                if [[ "${vol_types[$sel]}" == "sink" ]]; then
+                    pactl set-sink-volume "${vol_idxs[$sel]}" -5% 2>/dev/null
+                else
+                    pactl set-sink-input-volume "${vol_idxs[$sel]}" -5% 2>/dev/null
+                fi
+                ;;
+            ']')
+                if [[ "${vol_types[$sel]}" == "sink" ]]; then
+                    pactl set-sink-volume "${vol_idxs[$sel]}" +1% 2>/dev/null
+                else
+                    pactl set-sink-input-volume "${vol_idxs[$sel]}" +1% 2>/dev/null
+                fi
+                ;;
+            '[')
+                if [[ "${vol_types[$sel]}" == "sink" ]]; then
+                    pactl set-sink-volume "${vol_idxs[$sel]}" -1% 2>/dev/null
+                else
+                    pactl set-sink-input-volume "${vol_idxs[$sel]}" -1% 2>/dev/null
+                fi
+                ;;
+            0)
+                if [[ "${vol_types[$sel]}" == "sink" ]]; then
+                    pactl set-sink-mute "${vol_idxs[$sel]}" toggle 2>/dev/null
+                else
+                    pactl set-sink-input-mute "${vol_idxs[$sel]}" toggle 2>/dev/null
+                fi
+                ;;
+            b|B|ESC|q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+# ── TUI menu: Output ──
+
+tui_menu_output() {
+    local sel=0
+    while true; do
+        tui_refresh_sinks
+        local cur_default
+        cur_default=$(current_default_sink)
+
+        tui_clear
+        tui_header "Output"
+        printf '\n' >&2
+
+        printf '  Mute local: ' >&2
+        if [[ "$MUTE_LOCAL" == true ]]; then
+            printf '%b ON%b  (captured streams silent locally)\n' "$_R" "$_N" >&2
+        else
+            printf '%b OFF%b (captured streams also play locally)\n' "$_G" "$_N" >&2
+        fi
+        printf '\n' >&2
+
+        printf '  %bDefault output sink:%b\n' "$_B" "$_N" >&2
+        local total=${#_TUI_SINKS[@]}
+        (( sel >= total )) && sel=$(( total - 1 ))
+        (( sel < 0 )) && sel=0
+
+        local i
+        for (( i=0; i<total; i++ )); do
+            local rec="${_TUI_SINKS[$i]}"
+            local sname sdesc
+            IFS=$'\t' read -r sname sdesc <<< "$rec"
+
+            local ptr="  "
+            (( i == sel )) && ptr="▸ "
+            local marker="  "
+            [[ "$sname" == "$cur_default" ]] && marker="* "
+            local extra=""
+            [[ "$sname" == "$SINK_NAME" ]] && extra=" ${_C}(virtual sink)${_N}"
+
+            printf '  %s%s%d. %s%s\n' "$ptr" "$marker" $((i+1)) "$sdesc" "$extra" >&2
+        done
+
+        printf '\n' >&2
+        tui_rule
+        tui_hint "↑↓" "navigate"
+        tui_hint "Enter" "set as default"
+        tui_hint "m" "toggle mute-local"
+        printf '\n' >&2
+        tui_hint "b/Esc" "back"
+        printf '\n' >&2
+        tui_show_messages
+
+        local key
+        key=$(tui_read_key "$POLL_INTERVAL") || {
+            [[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+            verify_existing_links
+            continue
+        }
+
+        case "$key" in
+            UP)    (( sel > 0 )) && (( sel-- )) ;;
+            DOWN)  (( sel < total - 1 )) && (( sel++ )) || true ;;
+            ENTER|' ')
+                if (( total > 0 )); then
+                    local rec="${_TUI_SINKS[$sel]}"
+                    local sname sdesc
+                    IFS=$'\t' read -r sname sdesc <<< "$rec"
+                    if pactl set-default-sink "$sname" 2>/dev/null; then
+                        _tui_push_msg "Default sink → ${sdesc}"
+                    else
+                        _tui_push_msg "Failed to set default sink"
+                    fi
+                fi
+                ;;
+            [1-9])
+                local idx=$(( key - 1 ))
+                if (( idx < total )); then
+                    sel=$idx
+                    local rec="${_TUI_SINKS[$sel]}"
+                    local sname sdesc
+                    IFS=$'\t' read -r sname sdesc <<< "$rec"
+                    if pactl set-default-sink "$sname" 2>/dev/null; then
+                        _tui_push_msg "Default sink → ${sdesc}"
+                    else
+                        _tui_push_msg "Failed to set default sink"
+                    fi
+                fi
+                ;;
+            m|M)
+                if [[ "$MUTE_LOCAL" == true ]]; then
+                    # Switching OFF: restore all captured streams to default
+                    for nn in "${!CAPTURED[@]}"; do
+                        restore_stream_from_sink "$nn"
+                        link_stream_to_sink "$nn" 2>/dev/null || true
+                    done
+                    MOVED_INPUTS=()
+                    MUTE_LOCAL=false
+                    _tui_push_msg "Mute local → OFF"
+                else
+                    # Switching ON: move all captured streams to virtual sink
+                    MUTE_LOCAL=true
+                    for nn in "${!CAPTURED[@]}"; do
+                        move_stream_to_sink "$nn" || true
+                    done
+                    _tui_push_msg "Mute local → ON"
+                fi
+                ;;
+            b|B|ESC|q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+# ── TUI menu: Config ──
+
+tui_menu_config() {
+    while true; do
+        tui_clear
+        tui_header "Config"
+        printf '\n' >&2
+
+        printf '  %b[a]%b Auto-capture:   ' "$_Y" "$_N" >&2
+        if [[ "$AUTO_CAPTURE" == true ]]; then
+            printf '%bON%b\n' "$_G" "$_N" >&2
+        else
+            printf '%bOFF%b\n' "$_R" "$_N" >&2
+        fi
+
+        printf '  %b[m]%b Mute local:     ' "$_Y" "$_N" >&2
+        if [[ "$MUTE_LOCAL" == true ]]; then
+            printf '%bON%b\n' "$_R" "$_N" >&2
+        else
+            printf '%bOFF%b\n' "$_G" "$_N" >&2
+        fi
+
+        printf '  %b[p]%b Poll interval:  %ss\n' "$_Y" "$_N" "$POLL_INTERVAL" >&2
+
+        printf '\n' >&2
+        if (( ${#WHITELIST[@]} > 0 )); then
+            printf '  Whitelist: %s\n' "${WHITELIST[*]}" >&2
+        else
+            printf '  Whitelist: %b(none)%b\n' "$_D" "$_N" >&2
+        fi
+        printf '  %b[w]%b Edit whitelist\n' "$_Y" "$_N" >&2
+
+        printf '\n' >&2
+        if (( ${#BLACKLIST[@]} > 0 )); then
+            printf '  Blacklist: %s\n' "${BLACKLIST[*]}" >&2
+        else
+            printf '  Blacklist: %b(none)%b\n' "$_D" "$_N" >&2
+        fi
+        printf '  %b[e]%b Edit blacklist\n' "$_Y" "$_N" >&2
+
+        printf '\n' >&2
+        printf '  Sink name: %b%s%b\n' "$_B" "$SINK_NAME" "$_N" >&2
+        printf '  Description: %s\n' "$SINK_DESCRIPTION" >&2
+
+        printf '\n' >&2
+        tui_rule
+        tui_hint "b/Esc" "back"
+        printf '\n' >&2
+        tui_show_messages
+
+        local key
+        key=$(tui_read_key "$POLL_INTERVAL") || {
+            [[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+            verify_existing_links
+            continue
+        }
+
+        case "$key" in
+            a|A)
+                if [[ "$AUTO_CAPTURE" == true ]]; then
+                    AUTO_CAPTURE=false
+                    _tui_push_msg "Auto-capture → OFF"
+                else
+                    AUTO_CAPTURE=true
+                    _tui_push_msg "Auto-capture → ON"
+                fi
+                ;;
+            m|M)
+                if [[ "$MUTE_LOCAL" == true ]]; then
+                    for nn in "${!CAPTURED[@]}"; do
+                        restore_stream_from_sink "$nn"
+                        link_stream_to_sink "$nn" 2>/dev/null || true
+                    done
+                    MOVED_INPUTS=()
+                    MUTE_LOCAL=false
+                    _tui_push_msg "Mute local → OFF"
+                else
+                    MUTE_LOCAL=true
+                    for nn in "${!CAPTURED[@]}"; do
+                        move_stream_to_sink "$nn" || true
+                    done
+                    _tui_push_msg "Mute local → ON"
+                fi
+                ;;
+            p|P)
+                tui_show_cursor
+                printf '\n  New poll interval (seconds): ' >&2
+                local new_val=""
+                IFS= read -r new_val </dev/tty 2>/dev/null || true
+                tui_hide_cursor
+                if [[ "$new_val" =~ ^[0-9]+\.?[0-9]*$ ]] && [[ "$new_val" != "0" ]]; then
+                    POLL_INTERVAL="$new_val"
+                    _tui_push_msg "Poll interval → ${new_val}s"
+                else
+                    [[ -n "$new_val" ]] && _tui_push_msg "Invalid interval: ${new_val}"
+                fi
+                ;;
+            w|W)
+                tui_show_cursor
+                printf '\n  Whitelist (comma-separated, empty to clear): ' >&2
+                local new_val=""
+                IFS= read -r new_val </dev/tty 2>/dev/null || true
+                tui_hide_cursor
+                if [[ -z "$new_val" ]]; then
+                    WHITELIST=()
+                    _tui_push_msg "Whitelist cleared"
+                else
+                    IFS=',' read -ra WHITELIST <<< "$new_val"
+                    BLACKLIST=()
+                    _tui_push_msg "Whitelist → ${WHITELIST[*]}"
+                fi
+                ;;
+            e|E)
+                tui_show_cursor
+                printf '\n  Blacklist (comma-separated, empty to clear): ' >&2
+                local new_val=""
+                IFS= read -r new_val </dev/tty 2>/dev/null || true
+                tui_hide_cursor
+                if [[ -z "$new_val" ]]; then
+                    BLACKLIST=()
+                    _tui_push_msg "Blacklist cleared"
+                else
+                    IFS=',' read -ra BLACKLIST <<< "$new_val"
+                    WHITELIST=()
+                    _tui_push_msg "Blacklist → ${BLACKLIST[*]}"
+                fi
+                ;;
+            b|B|ESC|q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+# ── TUI menu: Info ──
+
+tui_menu_info() {
+    while true; do
+        tui_clear
+        tui_header "Info"
+        printf '\n' >&2
+
+        printf '  %bSink%b\n' "$_B" "$_N" >&2
+        printf '    Name:         %s\n' "$SINK_NAME" >&2
+        printf '    Description:  %s\n' "$SINK_DESCRIPTION" >&2
+        printf '    Module ID:    %s\n' "${MODULE_ID:-(reused)}" >&2
+        printf '    PID:          %s\n' "$$" >&2
+        printf '\n' >&2
+
+        printf '  %bRouting%b\n' "$_B" "$_N" >&2
+        printf '    Default sink: %s\n' "$(current_default_sink)" >&2
+        printf '    Auto-capture: %s\n' "$AUTO_CAPTURE" >&2
+        printf '    Mute local:   %s\n' "$MUTE_LOCAL" >&2
+        printf '\n' >&2
+
+        printf '  %bCaptured streams (%d)%b\n' "$_B" "${#CAPTURED[@]}" "$_N" >&2
+        if (( ${#CAPTURED[@]} > 0 )); then
+            local nn
+            for nn in "${!CAPTURED[@]}"; do
+                printf '    ● %s\n' "$nn" >&2
+            done
+        else
+            printf '    %b(none)%b\n' "$_D" "$_N" >&2
+        fi
+        printf '\n' >&2
+
+        # Show other instances
+        printf '  %bInstances%b\n' "$_B" "$_N" >&2
+        local f found_any=false
+        for f in "$RUNTIME_DIR"/*.pid; do
+            [[ -f "$f" ]] || continue
+            found_any=true
+            local iname
+            iname=$(basename "$f" .pid)
+            if read_pid_file "$f"; then
+                local status="running"
+                pid_alive "$_PF_PID" || status="STALE"
+                local marker="  "
+                [[ "$iname" == "$SINK_NAME" ]] && marker="→ "
+                printf '    %s%-20s  PID %-8s  %s\n' "$marker" "$iname" "$_PF_PID" "$status" >&2
+            fi
+        done
+        if [[ "$found_any" == false ]]; then
+            printf '    %b(none)%b\n' "$_D" "$_N" >&2
+        fi
+
+        printf '\n' >&2
+        tui_rule
+        tui_hint "b/Esc" "back"
+        printf '\n' >&2
+        tui_show_messages
+
+        local key
+        key=$(tui_read_key "$POLL_INTERVAL") || {
+            [[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+            verify_existing_links
+            continue
+        }
+        case "$key" in
+            b|B|ESC|q|Q|ENTER) return ;;
+        esac
+    done
+}
+
+# ── TUI main menu ──
+
+tui_menu_main() {
+    while true; do
+        tui_clear
+        tui_header ""
+        printf '\n' >&2
+
+        # Summary line
+        local svol
+        svol=$(tui_get_sink_volume "$SINK_NAME")
+        svol="${svol:-0}"
+        local smute
+        smute=$(tui_get_sink_mute "$SINK_NAME")
+
+        printf '  Sink: %b%s%b' "$_B" "$SINK_NAME" "$_N" >&2
+        [[ "$smute" == "yes" ]] && printf '  %b[MUTED]%b' "$_R" "$_N" >&2
+        printf '\n' >&2
+
+        printf '  Streams: %b%d%b captured' "$_B" "${#CAPTURED[@]}" "$_N" >&2
+        local ml_tag=""
+        [[ "$MUTE_LOCAL" == true ]] && ml_tag="  ${_R}(mute-local)${_N}"
+        printf '%b\n' "$ml_tag" >&2
+
+        printf '  Volume:  ' >&2
+        tui_volume_bar "$svol" 20
+        printf '\n\n' >&2
+
+        tui_rule
+        printf '\n' >&2
+        tui_hint "s" "Streams"
+        tui_hint "v" "Volume"
+        printf '\n' >&2
+        tui_hint "o" "Output"
+        tui_hint "c" "Config"
+        printf '\n' >&2
+        tui_hint "i" "Info"
+        tui_hint "q" "Quit"
+        printf '\n' >&2
+        tui_show_messages
+
+        local key
+        key=$(tui_read_key "$POLL_INTERVAL") || {
+            [[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+            verify_existing_links
+            continue
+        }
+
+        case "$key" in
+            s|S) tui_menu_streams ;;
+            v|V) tui_menu_volume ;;
+            o|O) tui_menu_output ;;
+            c|C) tui_menu_config ;;
+            i|I) tui_menu_info ;;
+            q|Q|ESC) return ;;
+        esac
+    done
+}
+
+# ── Interactive entry point ──
+
+interactive_loop() {
+    tui_init
+
+    tui_menu_main
+
+    tui_fini
 }
 
 # ─── entry point ─────────────────────────────────────────────────────────────
@@ -946,7 +1868,14 @@ main() {
     log "  Monitor / source: ${_B}${SINK_NAME}.monitor${_N}"
     log "───────────────────────────────────────"
 
-    monitor_loop
+    if [[ "$INTERACTIVE" == true ]]; then
+        interactive_loop
+    else
+        if [[ -t 0 && -t 2 ]]; then
+            log "Hint: run with ${_B}-i${_N} for an interactive TUI"
+        fi
+        monitor_loop
+    fi
 }
 
 main "$@"
