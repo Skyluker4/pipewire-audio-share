@@ -423,7 +423,7 @@ pactl set-sink-mute audio_share 0
 
 ## License
 
-Copyright © 2025 Luke Andrew Simmons
+Copyright © 2026 Luke Andrew Simmons
 
 This program is free software: you can redistribute it and/or modify it
 under the terms of the [GNU Affero General Public License, version 3](https://www.gnu.org/licenses/agpl-3.0.html)
