@@ -79,10 +79,10 @@ Bash script.
 ./audio-share.sh
 
 # Share only Firefox and mpv
-./audio-share.sh --whitelist "firefox,mpv"
+./audio-share.sh -w firefox -w mpv
 
 # Share everything except notification sounds
-./audio-share.sh --blacklist "notification,alert"
+./audio-share.sh -b notification -b alert
 
 # Share everything, silence local speakers (restored on exit)
 ./audio-share.sh --mute-local
@@ -108,19 +108,19 @@ audio-share.sh --stop-all
 
 ### Options
 
-| Flag                         | Description                                                   | Default       |
-| ---------------------------- | ------------------------------------------------------------- | ------------- |
-| `-n`, `--sink-name NAME`     | PipeWire sink name                                            | `audio_share` |
-| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc.          | `Audio Share` |
-| `-a`, `--auto-capture`       | Capture new streams as they appear                            | **on**        |
-| `-A`, `--no-auto-capture`    | Only capture streams present at startup                       |               |
-| `-w`, `--whitelist APPS`     | Comma-separated patterns — only matching streams are captured |               |
-| `-b`, `--blacklist APPS`     | Comma-separated patterns — matching streams are excluded      |               |
-| `-m`, `--mute-local`         | Don't play captured audio on the default output               | off           |
-| `-p`, `--poll-interval SECS` | How often to scan for changes                                 | `2`           |
-| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)                  |               |
-| `-v`, `--verbose`            | Print debug-level log output                                  |               |
-| `-h`, `--help`               | Show built-in help text                                       |               |
+| Flag                         | Description                                          | Default       |
+| ---------------------------- | ---------------------------------------------------- | ------------- |
+| `-n`, `--sink-name NAME`     | PipeWire sink name                                   | `audio_share` |
+| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc. | `Audio Share` |
+| `-a`, `--auto-capture`       | Capture new streams as they appear                   | **on**        |
+| `-A`, `--no-auto-capture`    | Only capture streams present at startup              |               |
+| `-w`, `--whitelist APP`      | Application pattern to capture (repeatable)          |               |
+| `-b`, `--blacklist APP`      | Application pattern to exclude (repeatable)          |               |
+| `-m`, `--mute-local`         | Don't play captured audio on the default output      | off           |
+| `-p`, `--poll-interval SECS` | How often to scan for changes                        | `2`           |
+| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)         |               |
+| `-v`, `--verbose`            | Print debug-level log output                         |               |
+| `-h`, `--help`               | Show built-in help text                              |               |
 
 ### Management commands
 
@@ -137,7 +137,7 @@ Whitelist and blacklist patterns are matched **case-insensitively** as
 (e.g. `alsa_playback.firefox`) and the `application.name`
 (e.g. `Firefox`).
 
-Partial matches work: `--whitelist "fire"` captures Firefox.
+Partial matches work: `-w fire` captures Firefox.
 
 Whitelist and blacklist are mutually exclusive.
 
@@ -149,7 +149,7 @@ Launch with `-i`:
 
 ```sh
 ./audio-share.sh -i
-./audio-share.sh -i -n sunshine --whitelist "firefox,mpv,steam"
+./audio-share.sh -i -n sunshine -w firefox -w mpv -w steam
 ```
 
 The TUI runs inside an **alternate screen buffer** so it doesn't pollute
@@ -221,10 +221,10 @@ Run as many instances as you need with different `--sink-name` values:
 
 ```sh
 # Terminal 1: Sunshine gets browser and game audio
-audio-share.sh -n sunshine -d "Sunshine" --whitelist "firefox,steam" &
+audio-share.sh -n sunshine -d "Sunshine" -w firefox -w steam &
 
 # Terminal 2: Discord bot gets only the music player, silenced locally
-audio-share.sh -n discord -d "Discord Bot" --whitelist "music" --mute-local &
+audio-share.sh -n discord -d "Discord Bot" -w music --mute-local &
 
 # Check on them
 audio-share.sh --status
@@ -337,7 +337,7 @@ streaming server compatible with Moonlight.
    ```
 
 3. All desktop audio now streams to your Moonlight client. Add
-   `--whitelist` to limit which applications are shared, or
+   `-w` to limit which applications are shared, or
    `--mute-local` to silence local speakers while streaming.
 
 ### OBS Studio

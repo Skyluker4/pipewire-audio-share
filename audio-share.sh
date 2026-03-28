@@ -128,10 +128,10 @@ usage() {
 		"    Capture new streams as they appear (default)" \
 		"-A, --no-auto-capture" \
 		"    Only capture streams present at start-up" \
-		"-w, --whitelist APPS" \
-		"    Comma-separated application patterns to capture" \
-		"-b, --blacklist APPS" \
-		"    Comma-separated application patterns to exclude" \
+		"-w, --whitelist APP" \
+		"    Application pattern to capture (repeatable)" \
+		"-b, --blacklist APP" \
+		"    Application pattern to exclude (repeatable)" \
 		"    (whitelist and blacklist are mutually exclusive)" \
 		"-m, --mute-local" \
 		"    Do NOT play captured audio on the default output" \
@@ -154,7 +154,7 @@ usage() {
 		"Patterns are matched case-insensitively as substrings against" \
 		"both the PipeWire node.name (e.g. \"alsa_playback.firefox\") and" \
 		"the application.name (e.g. \"Firefox\").  Partial matches work:" \
-		"--whitelist \"fire\" matches Firefox."
+		"-w fire matches Firefox."
 
 	_usage_section "HOW IT WORKS" \
 		"1. A module-null-sink is loaded, creating a virtual sink with" \
@@ -189,24 +189,24 @@ usage() {
 		"audio-share.sh" \
 		"" \
 		"# share only firefox and mpv" \
-		"audio-share.sh --whitelist \"firefox,mpv\"" \
+		"audio-share.sh -w firefox -w mpv" \
 		"" \
 		"# share everything except notification sounds" \
-		"audio-share.sh --blacklist \"notification,alert\"" \
+		"audio-share.sh -b notification -b alert" \
 		"" \
 		"# share everything, silence local speakers" \
 		"audio-share.sh --mute-local" \
 		"" \
 		"# multiple instances" \
-		"audio-share.sh -n sunshine -d \"Sunshine\" --whitelist \"firefox,mpv\" &" \
-		"audio-share.sh -n discord -d \"Discord\" --whitelist \"music\" -m &" \
+		"audio-share.sh -n sunshine -d \"Sunshine\" -w firefox -w mpv &" \
+		"audio-share.sh -n discord -d \"Discord\" -w music -m &" \
 		"audio-share.sh --status" \
 		"audio-share.sh --stop sunshine" \
 		"audio-share.sh --stop-all" \
 		"" \
 		"# interactive mode" \
 		"audio-share.sh -i" \
-		"audio-share.sh -i -n sunshine --whitelist \"firefox,mpv\""
+		"audio-share.sh -i -n sunshine -w firefox -w mpv"
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -247,11 +247,11 @@ parse_args() {
 			shift
 			;;
 		-w | --whitelist)
-			IFS=',' read -ra WHITELIST <<<"$2"
+			WHITELIST+=("$2")
 			shift 2
 			;;
 		-b | --blacklist)
-			IFS=',' read -ra BLACKLIST <<<"$2"
+			BLACKLIST+=("$2")
 			shift 2
 			;;
 		-m | --mute-local)
