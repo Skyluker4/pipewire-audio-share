@@ -14,7 +14,7 @@ _A clear and concise description of what the bug is._
 
 _Steps to reproduce the behavior:_
 
-1. _Run `audio-share.sh` with options '...'_
+1. _Run `pipewire-audio-share.sh` with options '...'_
 2. _See the error._
 
 ## Expected Behavior

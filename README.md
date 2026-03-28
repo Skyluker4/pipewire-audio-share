@@ -1,4 +1,4 @@
-# audio-share
+# pipewire-audio-share
 
 A PipeWire virtual sink manager that routes application audio into a
 capture-ready sink for streaming software like [Sunshine], [OBS], or any
@@ -59,12 +59,12 @@ pacman -S pipewire pipewire-pulse wireplumber jq
 ## Installation
 
 ```sh
-git clone <url> audio-share
-cd audio-share
-chmod +x audio-share.sh
+git clone <url> pipewire-audio-share
+cd pipewire-audio-share
+chmod +x pipewire-audio-share.sh
 
 # Optional: symlink into your PATH
-ln -s "$PWD/audio-share.sh" ~/.local/bin/audio-share
+ln -s "$PWD/pipewire-audio-share.sh" ~/.local/bin/pipewire-audio-share
 ```
 
 There is nothing to compile. The entire tool is a single self-contained
@@ -76,19 +76,19 @@ Bash script.
 
 ```sh
 # Share all application audio — you still hear everything locally
-./audio-share.sh
+./pipewire-audio-share.sh
 
 # Share only Firefox and mpv
-./audio-share.sh -I firefox -I mpv
+./pipewire-audio-share.sh -I firefox -I mpv
 
 # Share everything except notification sounds
-./audio-share.sh -X notification -X alert
+./pipewire-audio-share.sh -X notification -X alert
 
 # Share everything, silence local speakers (restored on exit)
-./audio-share.sh --mute-local
+./pipewire-audio-share.sh --mute-local
 
 # Launch the interactive TUI
-./audio-share.sh -i
+./pipewire-audio-share.sh -i
 ```
 
 Press **Ctrl+C** to stop. The virtual sink is removed and all streams are
@@ -99,11 +99,11 @@ restored to their original routing.
 ## Usage
 
 ```text
-audio-share.sh [OPTIONS]
-audio-share.sh -i [OPTIONS]
-audio-share.sh --status
-audio-share.sh --stop NAME
-audio-share.sh --stop-all
+pipewire-audio-share.sh [OPTIONS]
+pipewire-audio-share.sh -i [OPTIONS]
+pipewire-audio-share.sh --status
+pipewire-audio-share.sh --stop NAME
+pipewire-audio-share.sh --stop-all
 ```
 
 ### Options
@@ -124,11 +124,11 @@ audio-share.sh --stop-all
 
 ### Management commands
 
-| Command       | Description                                                            |
-| ------------- | ---------------------------------------------------------------------- |
-| `--status`    | List all running audio-share instances with PID, module ID, and status |
-| `--stop NAME` | Gracefully stop the instance managing the named sink                   |
-| `--stop-all`  | Stop every running instance                                            |
+| Command       | Description                                                                     |
+| ------------- | ------------------------------------------------------------------------------- |
+| `--status`    | List all running pipewire-audio-share instances with PID, module ID, and status |
+| `--stop NAME` | Gracefully stop the instance managing the named sink                            |
+| `--stop-all`  | Stop every running instance                                                     |
 
 ### Pattern matching
 
@@ -148,8 +148,8 @@ Include and exclude are mutually exclusive.
 Launch with `-i`:
 
 ```sh
-./audio-share.sh -i
-./audio-share.sh -i -n sunshine -I firefox -I mpv -I steam
+./pipewire-audio-share.sh -i
+./pipewire-audio-share.sh -i -n sunshine -I firefox -I mpv -I steam
 ```
 
 The TUI runs inside an **alternate screen buffer** so it doesn't pollute
@@ -221,24 +221,24 @@ Run as many instances as you need with different `--sink-name` values:
 
 ```sh
 # Terminal 1: Sunshine gets browser and game audio
-audio-share.sh -n sunshine -d "Sunshine" -I firefox -I steam &
+pipewire-audio-share.sh -n sunshine -d "Sunshine" -I firefox -I steam &
 
 # Terminal 2: Discord bot gets only the music player, silenced locally
-audio-share.sh -n discord -d "Discord Bot" -I music --mute-local &
+pipewire-audio-share.sh -n discord -d "Discord Bot" -I music --mute-local &
 
 # Check on them
-audio-share.sh --status
+pipewire-audio-share.sh --status
 
 # Stop one
-audio-share.sh --stop discord
+pipewire-audio-share.sh --stop discord
 
 # Stop everything
-audio-share.sh --stop-all
+pipewire-audio-share.sh --stop-all
 ```
 
 Each instance:
 
-- Has its own **PID file** in `$XDG_RUNTIME_DIR/audio-share/`
+- Has its own **PID file** in `$XDG_RUNTIME_DIR/pipewire-audio-share/`
 - Creates its own **null sink** with a unique module ID
 - Manages its own set of **captured streams** independently
 - **Refuses to start** if the sink name is already taken by a live instance
@@ -317,10 +317,10 @@ prevent `set -e` from racing with signal delivery.
 [Sunshine](https://github.com/LizardByte/Sunshine) is a self-hosted game
 streaming server compatible with Moonlight.
 
-1. Start audio-share before or alongside Sunshine:
+1. Start pipewire-audio-share before or alongside Sunshine:
 
    ```sh
-   audio-share.sh -n sunshine -d "Sunshine Audio" &
+   pipewire-audio-share.sh -n sunshine -d "Sunshine Audio" &
    ```
 
 2. In the Sunshine web UI (**Configuration → Audio**), set the
@@ -342,10 +342,10 @@ streaming server compatible with Moonlight.
 
 ### OBS Studio
 
-1. Start audio-share:
+1. Start pipewire-audio-share:
 
    ```sh
-   audio-share.sh -n obs_capture -d "OBS Capture" &
+   pipewire-audio-share.sh -n obs_capture -d "OBS Capture" &
    ```
 
 2. In OBS, add an **Audio Input Capture** source (PulseAudio mode).
@@ -368,10 +368,10 @@ output ports to the virtual sink's input ports.
 
 ## Files
 
-| Path                                 | Purpose                                        |
-| ------------------------------------ | ---------------------------------------------- |
-| `audio-share.sh`                     | The entire tool — single self-contained script |
-| `$XDG_RUNTIME_DIR/audio-share/*.pid` | Per-instance PID files (`PID:MODULE_ID`)       |
+| Path                                          | Purpose                                        |
+| --------------------------------------------- | ---------------------------------------------- |
+| `pipewire-audio-share.sh`                     | The entire tool — single self-contained script |
+| `$XDG_RUNTIME_DIR/pipewire-audio-share/*.pid` | Per-instance PID files (`PID:MODULE_ID`)       |
 
 ---
 
@@ -383,9 +383,9 @@ Another instance is already running with that sink name. Either stop it
 first or use a different `--sink-name`:
 
 ```sh
-audio-share.sh --stop audio_share
+pipewire-audio-share.sh --stop audio_share
 # or
-audio-share.sh -n my_other_sink
+pipewire-audio-share.sh -n my_other_sink
 ```
 
 ### Stale sink after a crash

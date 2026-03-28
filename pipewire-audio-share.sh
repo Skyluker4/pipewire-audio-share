@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# audio-share.sh — PipeWire virtual sink for sharing application audio
+# pipewire-audio-share.sh — PipeWire virtual sink for sharing application audio
 #
 # Creates a null sink and routes application audio streams into it so that
 # capture software (Sunshine, OBS, etc.) can read the sink's monitor ports.
@@ -37,7 +37,7 @@ declare -a EXCLUDE=()
 MODULE_ID=""
 STARTUP_DEFAULT_SINK="" # captured once; used only as a last resort
 CLEANUP_DONE=false
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/audio-share"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/pipewire-audio-share"
 declare -A CAPTURED=()      # node_name → "1"  (streams we are managing)
 declare -A SKIPPED=()       # node_name → "1"  (streams we skipped, e.g. peer-owned)
 declare -A MOVED_INPUTS=()  # pactl_index → original_sink  (for mute-local restore)
@@ -109,15 +109,15 @@ _usage_section() {
 
 usage() {
 	cat <<-'EOF'
-		audio-share — route application audio into a virtual PipeWire sink
+		pipewire-audio-share — route application audio into a virtual PipeWire sink
 	EOF
 
 	_usage_section "USAGE" \
-		"audio-share.sh [OPTIONS]" \
-		"audio-share.sh -i [OPTIONS]" \
-		"audio-share.sh --status" \
-		"audio-share.sh --stop NAME" \
-		"audio-share.sh --stop-all"
+		"pipewire-audio-share.sh [OPTIONS]" \
+		"pipewire-audio-share.sh -i [OPTIONS]" \
+		"pipewire-audio-share.sh --status" \
+		"pipewire-audio-share.sh --stop NAME" \
+		"pipewire-audio-share.sh --stop-all"
 
 	_usage_section "OPTIONS" \
 		"-n, --sink-name NAME" \
@@ -146,9 +146,9 @@ usage() {
 		"    Show this help"
 
 	_usage_section "MANAGEMENT" \
-		"--status      List all running audio-share instances" \
+		"--status      List all running pipewire-audio-share instances" \
 		"--stop NAME   Stop the instance with the given sink name" \
-		"--stop-all    Stop every running audio-share instance"
+		"--stop-all    Stop every running pipewire-audio-share instance"
 
 	_usage_section "MATCHING" \
 		"Patterns are matched case-insensitively as substrings against" \
@@ -177,36 +177,36 @@ usage() {
 		"You can run several instances simultaneously with different" \
 		"--sink-name values and independent filter/mute options.  Each" \
 		"instance is tracked by a PID file in" \
-		"\$XDG_RUNTIME_DIR/audio-share/.  Stale sinks left behind by a" \
+		"\$XDG_RUNTIME_DIR/pipewire-audio-share/.  Stale sinks left behind by a" \
 		"crashed instance are automatically cleaned up on the next start." \
 		"" \
 		"When --mute-local is active, an instance will skip streams that" \
-		"are already owned by another audio-share instance to prevent" \
+		"are already owned by another pipewire-audio-share instance to prevent" \
 		"the two from fighting over the same sink-input."
 
 	_usage_section "EXAMPLES" \
 		"# share everything, keep local playback" \
-		"audio-share.sh" \
+		"pipewire-audio-share.sh" \
 		"" \
 		"# share only firefox and mpv" \
-		"audio-share.sh -I firefox -I mpv" \
+		"pipewire-audio-share.sh -I firefox -I mpv" \
 		"" \
 		"# share everything except notification sounds" \
-		"audio-share.sh -X notification -X alert" \
+		"pipewire-audio-share.sh -X notification -X alert" \
 		"" \
 		"# share everything, silence local speakers" \
-		"audio-share.sh --mute-local" \
+		"pipewire-audio-share.sh --mute-local" \
 		"" \
 		"# multiple instances" \
-		"audio-share.sh -n sunshine -d \"Sunshine\" -I firefox -I mpv &" \
-		"audio-share.sh -n discord -d \"Discord\" -I music -m &" \
-		"audio-share.sh --status" \
-		"audio-share.sh --stop sunshine" \
-		"audio-share.sh --stop-all" \
+		"pipewire-audio-share.sh -n sunshine -d \"Sunshine\" -I firefox -I mpv &" \
+		"pipewire-audio-share.sh -n discord -d \"Discord\" -I music -m &" \
+		"pipewire-audio-share.sh --status" \
+		"pipewire-audio-share.sh --stop sunshine" \
+		"pipewire-audio-share.sh --stop-all" \
 		"" \
 		"# interactive mode" \
-		"audio-share.sh -i" \
-		"audio-share.sh -i -n sunshine -I firefox -I mpv"
+		"pipewire-audio-share.sh -i" \
+		"pipewire-audio-share.sh -i -n sunshine -I firefox -I mpv"
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -364,7 +364,7 @@ release_lock() {
 
 # ── management commands ──────────────────────────────────────────────────────
 
-# Return a list of all known audio-share sink names (from PID files).
+# Return a list of all known pipewire-audio-share sink names (from PID files).
 all_instance_names() {
 	local f
 	for f in "$RUNTIME_DIR"/*.pid; do
@@ -413,7 +413,7 @@ cmd_status() {
 	done
 
 	if [[ "$found" == false ]]; then
-		echo "No audio-share instances found."
+		echo "No pipewire-audio-share instances found."
 	fi
 }
 
@@ -468,7 +468,7 @@ cmd_stop_all() {
 	local names
 	names=$(all_instance_names)
 	if [[ -z "$names" ]]; then
-		echo "No audio-share instances found."
+		echo "No pipewire-audio-share instances found."
 		return 0
 	fi
 	while IFS= read -r name; do
@@ -717,7 +717,7 @@ get_sink_name_by_index() {
 	pactl list short sinks 2>/dev/null | awk -v i="$idx" '$1 == i { print $2 }'
 }
 
-# Check whether a stream is currently on a sink owned by another audio-share
+# Check whether a stream is currently on a sink owned by another pipewire-audio-share
 # instance.  Returns 0 if the stream is owned by a peer, 1 otherwise.
 stream_owned_by_peer() {
 	local node_name="$1"
@@ -826,7 +826,7 @@ capture_stream() {
 	if [[ "$MUTE_LOCAL" == true ]]; then
 		# Check peer ownership to avoid fighting another instance
 		if stream_owned_by_peer "$node_name"; then
-			warn "Skipping ${app_name:-$node_name}: already owned by another audio-share instance"
+			warn "Skipping ${app_name:-$node_name}: already owned by another pipewire-audio-share instance"
 			return 1
 		fi
 		# Move exclusively to virtual sink (no local playback).
@@ -1126,7 +1126,7 @@ tui_read_key() {
 tui_header() {
 	local title="$1"
 	tui_size
-	printf '%b  audio-share' "$_B" >&2
+	printf '%b  pipewire-audio-share' "$_B" >&2
 	[[ -n "$title" ]] && printf ' ▸ %s' "$title" >&2
 	printf '%b\n' "$_N" >&2
 	local i
@@ -1981,7 +1981,7 @@ main() {
 
 	# Banner
 	log "═══════════════════════════════════════"
-	log " ${_B}audio-share${_N}  —  PipeWire audio router"
+	log " ${_B}pipewire-audio-share${_N}  —  PipeWire audio router"
 	log "═══════════════════════════════════════"
 	log "Sink name:     ${_B}${SINK_NAME}${_N}"
 	log "Description:   ${SINK_DESCRIPTION}"

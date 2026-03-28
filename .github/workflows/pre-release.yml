@@ -29,4 +29,4 @@ jobs:
             --prerelease \
             --generate-notes \
             --target "$GITHUB_SHA" \
-            audio-share.sh
+            pipewire-audio-share.sh
