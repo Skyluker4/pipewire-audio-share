@@ -95,96 +95,116 @@ die() {
 
 # ─── usage ───────────────────────────────────────────────────────────────────
 
+_usage_section() {
+	local heading="$1"
+	shift
+	printf '\n%s\n' "$heading"
+	local line
+	for line in "$@"; do
+		printf '    %s\n' "$line"
+	done
+}
+
 usage() {
-	cat <<'EOF'
-audio-share — route application audio into a virtual PipeWire sink
+	cat <<-'EOF'
+		audio-share — route application audio into a virtual PipeWire sink
+	EOF
 
-USAGE
-    audio-share.sh [OPTIONS]
-    audio-share.sh -i [OPTIONS]
-    audio-share.sh --status
-    audio-share.sh --stop NAME
-    audio-share.sh --stop-all
+	_usage_section "USAGE" \
+		"audio-share.sh [OPTIONS]" \
+		"audio-share.sh -i [OPTIONS]" \
+		"audio-share.sh --status" \
+		"audio-share.sh --stop NAME" \
+		"audio-share.sh --stop-all"
 
-OPTIONS
-    -n, --sink-name NAME          PipeWire sink name         (default: audio_share)
-    -d, --description DESC        Human-readable description (default: Audio Share)
+	_usage_section "OPTIONS" \
+		"-n, --sink-name NAME" \
+		"    PipeWire sink name (default: audio_share)" \
+		"-d, --description DESC" \
+		"    Human-readable description (default: Audio Share)" \
+		"-a, --auto-capture" \
+		"    Capture new streams as they appear (default)" \
+		"-A, --no-auto-capture" \
+		"    Only capture streams present at start-up" \
+		"-w, --whitelist APPS" \
+		"    Comma-separated application patterns to capture" \
+		"-b, --blacklist APPS" \
+		"    Comma-separated application patterns to exclude" \
+		"    (whitelist and blacklist are mutually exclusive)" \
+		"-m, --mute-local" \
+		"    Do NOT play captured audio on the default output" \
+		"    (moves streams exclusively to the virtual sink)" \
+		"-p, --poll-interval SECS" \
+		"    How often to scan for changes (default: 2)" \
+		"-i, --interactive" \
+		"    Launch interactive TUI (requires a terminal)" \
+		"-v, --verbose" \
+		"    Print extra debug output" \
+		"-h, --help" \
+		"    Show this help"
 
-    -a, --auto-capture            Capture new streams as they appear (default)
-    -A, --no-auto-capture         Only capture streams present at start-up
+	_usage_section "MANAGEMENT" \
+		"--status      List all running audio-share instances" \
+		"--stop NAME   Stop the instance with the given sink name" \
+		"--stop-all    Stop every running audio-share instance"
 
-    -w, --whitelist APPS          Comma-separated application patterns to capture
-    -b, --blacklist APPS          Comma-separated application patterns to exclude
-                                  (whitelist and blacklist are mutually exclusive)
+	_usage_section "MATCHING" \
+		"Patterns are matched case-insensitively as substrings against" \
+		"both the PipeWire node.name (e.g. \"alsa_playback.firefox\") and" \
+		"the application.name (e.g. \"Firefox\").  Partial matches work:" \
+		"--whitelist \"fire\" matches Firefox."
 
-    -m, --mute-local              Do NOT play captured audio on the default output
-                                  (moves streams exclusively to the virtual sink)
+	_usage_section "HOW IT WORKS" \
+		"1. A module-null-sink is loaded, creating a virtual sink with" \
+		"   playback (input) ports and monitor (output) ports." \
+		"" \
+		"2. For every matching audio stream, pw-link adds additional" \
+		"   links from the stream's output ports to the virtual sink." \
+		"   The existing WirePlumber-managed link to the default sink" \
+		"   is left in place, so you still hear the audio locally." \
+		"" \
+		"3. If --mute-local is given, each stream is instead moved to" \
+		"   the virtual sink via pactl move-sink-input, which tells" \
+		"   WirePlumber to route exclusively there.  On exit the" \
+		"   streams are moved back." \
+		"" \
+		"4. Capture software (Sunshine, OBS, ...) selects the virtual" \
+		"   sink or its monitor source as its audio input."
 
-    -p, --poll-interval SECS      How often to scan for changes (default: 2)
-    -i, --interactive             Launch interactive TUI (requires a terminal)
-    -v, --verbose                 Print extra debug output
-    -h, --help                    Show this help
+	_usage_section "MULTIPLE INSTANCES" \
+		"You can run several instances simultaneously with different" \
+		"--sink-name values and independent filter/mute options.  Each" \
+		"instance is tracked by a PID file in" \
+		"\$XDG_RUNTIME_DIR/audio-share/.  Stale sinks left behind by a" \
+		"crashed instance are automatically cleaned up on the next start." \
+		"" \
+		"When --mute-local is active, an instance will skip streams that" \
+		"are already owned by another audio-share instance to prevent" \
+		"the two from fighting over the same sink-input."
 
-MANAGEMENT
-    --status                      List all running audio-share instances
-    --stop NAME                   Stop the instance with the given sink name
-    --stop-all                    Stop every running audio-share instance
-
-MATCHING
-    Patterns are matched case-insensitively as substrings against both the
-    PipeWire node.name (e.g. "alsa_playback.firefox") and the application.name
-    (e.g. "Firefox").  Partial matches work: --whitelist "fire" matches Firefox.
-
-HOW IT WORKS
-    1.  A module-null-sink is loaded, creating a virtual sink with playback
-        (input) ports and monitor (output) ports.
-
-    2.  For every matching audio stream, pw-link adds *additional* links from
-        the stream's output ports to the virtual sink's playback ports.
-        The existing WirePlumber-managed link to the default hardware sink is
-        left in place, so you still hear the audio locally.
-
-    3.  If --mute-local is given, each stream is instead *moved* to the
-        virtual sink via `pactl move-sink-input`, which tells WirePlumber to
-        route exclusively there.  On exit the streams are moved back.
-
-    4.  Capture software (Sunshine, OBS, …) selects the virtual sink — or its
-        monitor source — as its audio input.
-
-MULTIPLE INSTANCES
-    You can run several instances simultaneously with different --sink-name
-    values and independent filter/mute options.  Each instance is tracked by
-    a PID file in $XDG_RUNTIME_DIR/audio-share/.  Stale sinks left behind
-    by a crashed instance are automatically cleaned up on the next start.
-
-    When --mute-local is active, an instance will skip streams that are
-    already owned by another running audio-share instance to prevent the
-    two from fighting over the same sink-input.
-
-EXAMPLES
-    # share everything, keep local playback
-    audio-share.sh
-
-    # share only firefox and mpv
-    audio-share.sh --whitelist "firefox,mpv"
-
-    # share everything except notification sounds
-    audio-share.sh --blacklist "notification,alert"
-
-    # share everything, silence local speakers
-    audio-share.sh --mute-local
-
-    # multiple instances: one for Sunshine, one for Discord bot
-    audio-share.sh -n sunshine_audio -d "Sunshine" --whitelist "firefox,mpv,steam" &
-    audio-share.sh -n discord_audio  -d "Discord"  --whitelist "music-player" --mute-local &
-    audio-share.sh --status
-    audio-share.sh --stop sunshine_audio
-    audio-share.sh --stop-all
-
-    # interactive mode — live TUI for managing streams, volume, etc.
-    audio-share.sh -i
-    audio-share.sh -i -n sunshine_audio --whitelist "firefox,mpv"
-EOF
+	_usage_section "EXAMPLES" \
+		"# share everything, keep local playback" \
+		"audio-share.sh" \
+		"" \
+		"# share only firefox and mpv" \
+		"audio-share.sh --whitelist \"firefox,mpv\"" \
+		"" \
+		"# share everything except notification sounds" \
+		"audio-share.sh --blacklist \"notification,alert\"" \
+		"" \
+		"# share everything, silence local speakers" \
+		"audio-share.sh --mute-local" \
+		"" \
+		"# multiple instances" \
+		"audio-share.sh -n sunshine -d \"Sunshine\" --whitelist \"firefox,mpv\" &" \
+		"audio-share.sh -n discord -d \"Discord\" --whitelist \"music\" -m &" \
+		"audio-share.sh --status" \
+		"audio-share.sh --stop sunshine" \
+		"audio-share.sh --stop-all" \
+		"" \
+		"# interactive mode" \
+		"audio-share.sh -i" \
+		"audio-share.sh -i -n sunshine --whitelist \"firefox,mpv\""
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -478,9 +498,9 @@ sink_exists() {
 get_sink_module_id() {
 	local target="$1"
 	pactl list sinks 2>/dev/null | awk -v name="$target" '
-        /^\tName:/ { current = $2 }
-        /^\tOwner Module:/ && current == name { print $3; exit }
-    '
+		/^\tName:/ { current = $2 }
+		/^\tOwner Module:/ && current == name { print $3; exit }
+	'
 }
 
 create_sink() {
@@ -543,15 +563,15 @@ remove_sink() {
 #   { "node_name": "…", "app_name": "…", "serial": 123 }
 get_audio_streams() {
 	pw-dump 2>/dev/null | jq -c '
-        [ .[]
-          | select(.info.props."media.class" == "Stream/Output/Audio")
-          | {
-              node_name:  .info.props."node.name",
-              app_name:  (.info.props."application.name" // ""),
-              serial:    (.info.props."object.serial" // 0)
-            }
-        ] | .[]
-    ' 2>/dev/null
+		[ .[]
+			| select(.info.props."media.class" == "Stream/Output/Audio")
+			| {
+				node_name:  .info.props."node.name",
+				app_name:  (.info.props."application.name" // ""),
+				serial:    (.info.props."object.serial" // 0)
+			}
+		] | .[]
+	' 2>/dev/null
 }
 
 # ─── filter logic ────────────────────────────────────────────────────────────
@@ -598,11 +618,11 @@ stream_matches_filter() {
 link_exists() {
 	local out="$1" in="$2"
 	pw-link -l 2>/dev/null | awk -v out="$out" -v inp="$in" '
-        $0 == out          { found = 1; next }
-        found && /^\s/     { gsub(/^\s+\|-> /, ""); if ($0 == inp) exit 0; next }
-        found && !/^\s/    { found = 0 }
-        END                { exit 1 }
-    '
+		$0 == out          { found = 1; next }
+		found && /^\s/     { gsub(/^\s+\|-> /, ""); if ($0 == inp) exit 0; next }
+		found && !/^\s/    { found = 0 }
+		END                { exit 1 }
+	'
 }
 
 # Resolve the virtual-sink playback port that should receive a given channel.
@@ -672,19 +692,19 @@ link_stream_to_sink() {
 get_sink_input_indices() {
 	local target="$1"
 	pactl list sink-inputs 2>/dev/null | awk -v target="$target" '
-        /^Sink Input #/ {
-            idx = $3; gsub(/#/, "", idx); sink = ""
-        }
-        /^\tSink:/ {
-            sink = $2
-        }
-        /node\.name =/ {
-            val = $0
-            gsub(/.*= "/, "", val)
-            gsub(/".*/, "", val)
-            if (val == target) print idx ":" sink
-        }
-    '
+		/^Sink Input #/ {
+			idx = $3; gsub(/#/, "", idx); sink = ""
+		}
+		/^\tSink:/ {
+			sink = $2
+		}
+		/node\.name =/ {
+			val = $0
+			gsub(/.*= "/, "", val)
+			gsub(/".*/, "", val)
+			if (val == target) print idx ":" sink
+		}
+	'
 }
 
 # Get the pactl name of a sink given its numeric index.
@@ -979,12 +999,12 @@ cleanup() {
 		# sink back to the default output.
 		local leftover
 		leftover=$(pactl list sink-inputs 2>/dev/null | awk -v s="$SINK_NAME" '
-            /^Sink Input #/ { idx = $3; gsub(/#/,"",idx) }
-            /node\.name =/ {
-                val = $0; gsub(/.*= "/,"",val); gsub(/".*/,"",val)
-                if (val == s) print idx
-            }
-        ' || true)
+			/^Sink Input #/ { idx = $3; gsub(/#/,"",idx) }
+			/node\.name =/ {
+				val = $0; gsub(/.*= "/,"",val); gsub(/".*/,"",val)
+				if (val == s) print idx
+			}
+		' || true)
 		while IFS= read -r idx; do
 			[[ -z "$idx" ]] && continue
 			pactl move-sink-input "$idx" "$live_default" 2>/dev/null &&
@@ -1165,34 +1185,34 @@ tui_get_sink_mute() {
 tui_get_input_volume_by_idx() {
 	local target_idx="$1"
 	pactl list sink-inputs 2>/dev/null | awk -v idx="$target_idx" '
-        /^Sink Input #/ { cur=$3; gsub(/#/,"",cur); vol="" }
-        /^\tVolume:/ {
-            for(i=1;i<=NF;i++) if($i ~ /%/) {gsub(/%/,"",$i); vol=$i+0; break}
-        }
-        /^\tMute:/ && cur==idx { mute=$2 }
-        /node\.name =/ && cur==idx { if(vol!="") print vol; exit }
-    '
+		/^Sink Input #/ { cur=$3; gsub(/#/,"",cur); vol="" }
+		/^\tVolume:/ {
+			for(i=1;i<=NF;i++) if($i ~ /%/) {gsub(/%/,"",$i); vol=$i+0; break}
+		}
+		/^\tMute:/ && cur==idx { mute=$2 }
+		/node\.name =/ && cur==idx { if(vol!="") print vol; exit }
+	'
 }
 
 # Get mute state for a sink-input by pactl index → "yes" or "no".
 tui_get_input_mute_by_idx() {
 	local target_idx="$1"
 	pactl list sink-inputs 2>/dev/null | awk -v idx="$target_idx" '
-        /^Sink Input #/ { cur=$3; gsub(/#/,"",cur); mute="" }
-        /^\tMute:/ && cur==idx { print $2; exit }
-    '
+		/^Sink Input #/ { cur=$3; gsub(/#/,"",cur); mute="" }
+		/^\tMute:/ && cur==idx { print $2; exit }
+	'
 }
 
 # Get the first pactl sink-input index for a given node_name.
 tui_get_input_idx() {
 	local target="$1"
 	pactl list sink-inputs 2>/dev/null | awk -v t="$target" '
-        /^Sink Input #/ { idx=$3; gsub(/#/,"",idx) }
-        /node\.name =/ {
-            val=$0; gsub(/.*= "/,"",val); gsub(/".*/,"",val)
-            if(val==t) { print idx; exit }
-        }
-    '
+		/^Sink Input #/ { idx=$3; gsub(/#/,"",idx) }
+		/node\.name =/ {
+			val=$0; gsub(/.*= "/,"",val); gsub(/".*/,"",val)
+			if(val==t) { print idx; exit }
+		}
+	'
 }
 
 # Collect all audio streams as an indexed bash array of tab-separated records:
@@ -1239,12 +1259,12 @@ tui_refresh_sinks() {
 		[[ -z "$line" ]] && continue
 		_TUI_SINKS+=("$line")
 	done < <(pactl list sinks 2>/dev/null | awk '
-        /^\tName:/ { name=$2 }
-        /^\tDescription:/ {
-            desc=$0; gsub(/^\tDescription: /,"",desc)
-            print name "\t" desc
-        }
-    ')
+		/^\tName:/ { name=$2 }
+		/^\tDescription:/ {
+			desc=$0; gsub(/^\tDescription: /,"",desc)
+			print name "\t" desc
+		}
+	')
 }
 
 # ── TUI menu: Streams ──
