@@ -30,7 +30,7 @@ declare -a BLACKLIST=()
 # ─── runtime state ───────────────────────────────────────────────────────────
 
 MODULE_ID=""
-DEFAULT_SINK=""
+STARTUP_DEFAULT_SINK=""      # captured once; used only as a last resort
 CLEANUP_DONE=false
 declare -A CAPTURED=()          # node_name → "1"  (streams we are managing)
 declare -A MOVED_INPUTS=()      # pactl_index → original_sink  (for mute-local restore)
@@ -154,10 +154,17 @@ check_deps() {
 
 # ─── sink management ────────────────────────────────────────────────────────
 
+# Capture the default sink at startup (fallback of last resort).
 get_default_sink() {
-    DEFAULT_SINK=$(pactl get-default-sink 2>/dev/null) \
+    STARTUP_DEFAULT_SINK=$(pactl get-default-sink 2>/dev/null) \
         || die "Could not determine default audio sink"
-    log "Default sink: ${_B}${DEFAULT_SINK}${_N}"
+    log "Default sink: ${_B}${STARTUP_DEFAULT_SINK}${_N}"
+}
+
+# Return the *current* default sink, falling back to the startup value if the
+# query fails (e.g. PipeWire restarted mid-run).
+current_default_sink() {
+    pactl get-default-sink 2>/dev/null || printf '%s' "$STARTUP_DEFAULT_SINK"
 }
 
 sink_exists() {
@@ -372,7 +379,7 @@ move_stream_to_sink() {
         [[ "$current_sink_name" == "$SINK_NAME" ]] && { moved=true; continue; }
 
         # Remember where it was so we can restore later
-        MOVED_INPUTS["$idx"]="${current_sink_name:-$DEFAULT_SINK}"
+        MOVED_INPUTS["$idx"]="${current_sink_name:-$(current_default_sink)}"
 
         if pactl move-sink-input "$idx" "$SINK_NAME" 2>/dev/null; then
             log "  Moved sink-input #${idx} → ${SINK_NAME} (was ${current_sink_name:-?})"
@@ -393,16 +400,18 @@ restore_stream_from_sink() {
     [[ -z "$entries" ]] && return 0
 
     local entry idx
+    local live_default
+    live_default=$(current_default_sink)
     while IFS= read -r entry; do
         idx="${entry%%:*}"
-        local orig="${MOVED_INPUTS[$idx]:-$DEFAULT_SINK}"
+        local orig="${MOVED_INPUTS[$idx]:-$live_default}"
 
         if pactl move-sink-input "$idx" "$orig" 2>/dev/null; then
             log "  Restored sink-input #${idx} → ${orig}"
         else
-            # Sink may have vanished; try default
-            pactl move-sink-input "$idx" "$DEFAULT_SINK" 2>/dev/null \
-                && log "  Restored sink-input #${idx} → ${DEFAULT_SINK} (fallback)" \
+            # Saved sink may have vanished; try the current default
+            pactl move-sink-input "$idx" "$live_default" 2>/dev/null \
+                && log "  Restored sink-input #${idx} → ${live_default} (fallback)" \
                 || debug "  Could not restore sink-input #${idx}"
         fi
         unset "MOVED_INPUTS[$idx]"
@@ -508,7 +517,7 @@ verify_existing_links() {
                 current_sink_name=$(get_sink_name_by_index "$current_sink")
                 if [[ "$current_sink_name" != "$SINK_NAME" ]]; then
                     debug "Re-moving ${node_name} (sink-input #${idx}) back to ${SINK_NAME}"
-                    MOVED_INPUTS["$idx"]="${current_sink_name:-$DEFAULT_SINK}"
+                    MOVED_INPUTS["$idx"]="${current_sink_name:-$(current_default_sink)}"
                     pactl move-sink-input "$idx" "$SINK_NAME" 2>/dev/null || true
                 fi
             done <<< "$entries"
@@ -536,6 +545,8 @@ cleanup() {
     # Restore muted streams before removing the sink
     if [[ "$MUTE_LOCAL" == true ]]; then
         log "Restoring streams to default output …"
+        local live_default
+        live_default=$(current_default_sink)
         for node_name in "${!CAPTURED[@]}"; do
             restore_stream_from_sink "$node_name"
         done
@@ -552,7 +563,7 @@ cleanup() {
         ' || true)
         while IFS= read -r idx; do
             [[ -z "$idx" ]] && continue
-            pactl move-sink-input "$idx" "$DEFAULT_SINK" 2>/dev/null \
+            pactl move-sink-input "$idx" "$live_default" 2>/dev/null \
                 && log "  Fallback-restored sink-input #${idx}" || true
         done <<< "$leftover"
     fi
