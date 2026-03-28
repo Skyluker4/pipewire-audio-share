@@ -423,4 +423,14 @@ pactl set-sink-mute audio_share 0
 
 ## License
 
-[MIT](https://opensource.org/licenses/MIT)
+Copyright © 2025 Luke Andrew Simmons
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the [GNU Affero General Public License, version 3](https://www.gnu.org/licenses/agpl-3.0.html)
+only, as published by the Free Software Foundation.
+
+If the FSF publishes a new version of the GNU Affero General Public
+License, Luke Andrew Simmons (or their designated successor) is the proxy
+who may decide whether future versions of that license apply to this work.
+
+See [LICENSE](LICENSE) for the full text.

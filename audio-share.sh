@@ -16,7 +16,7 @@
 # Requires: pw-link  pw-dump  pactl  jq  (all part of a standard PipeWire
 #           + PipeWire-Pulse + pipewire-tools install)
 #
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: AGPL-3.0-only
 
 set -euo pipefail
 
