@@ -29,12 +29,16 @@ MUTE_LOCAL=false
 POLL_INTERVAL=2
 VERBOSE=false
 INTERACTIVE=false
+CREATE_SOURCE=false
+SOURCE_NAME=""
+SOURCE_DESCRIPTION=""
 declare -a INCLUDE=()
 declare -a EXCLUDE=()
 
 # ─── runtime state ───────────────────────────────────────────────────────────
 
 MODULE_ID=""
+SOURCE_MODULE_ID=""
 STARTUP_DEFAULT_SINK="" # captured once; used only as a last resort
 CLEANUP_DONE=false
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/pipewire-audio-share"
@@ -137,6 +141,13 @@ usage() {
 		"-m, --mute-local" \
 		"    Do NOT play captured audio on the default output" \
 		"    (moves streams exclusively to the virtual sink)" \
+		"-S, --source" \
+		"    Also create a virtual input device (source) from the" \
+		"    sink's monitor so apps can use it as a microphone" \
+		"--source-name NAME" \
+		"    Name for the virtual source (default: <sink-name>_input)" \
+		"--source-description DESC" \
+		"    Description for the virtual source" \
 		"-p, --poll-interval SECS" \
 		"    How often to scan for changes (default: 2)" \
 		"-i, --interactive" \
@@ -172,7 +183,11 @@ usage() {
 		"   streams are moved back." \
 		"" \
 		"4. Capture software (Sunshine, OBS, ...) selects the virtual" \
-		"   sink or its monitor source as its audio input."
+		"   sink or its monitor source as its audio input." \
+		"" \
+		"5. If --source is given, a module-remap-source is loaded that" \
+		"   exposes the sink's monitor as a regular input device," \
+		"   so applications like Discord can select it as a mic."
 
 	_usage_section "MULTIPLE INSTANCES" \
 		"You can run several instances simultaneously with different" \
@@ -207,7 +222,11 @@ usage() {
 		"" \
 		"# interactive mode" \
 		"pipewire-audio-share.sh -i" \
-		"pipewire-audio-share.sh -i -n sunshine -I firefox -I mpv"
+		"pipewire-audio-share.sh -i -n sunshine -I firefox -I mpv" \
+		"" \
+		"# create a virtual microphone from the shared audio" \
+		"pipewire-audio-share.sh --source" \
+		"pipewire-audio-share.sh -S --source-name my_mic -I firefox"
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -259,6 +278,18 @@ parse_args() {
 			MUTE_LOCAL=true
 			shift
 			;;
+		-S | --source)
+			CREATE_SOURCE=true
+			shift
+			;;
+		--source-name)
+			SOURCE_NAME="$2"
+			shift 2
+			;;
+		--source-description)
+			SOURCE_DESCRIPTION="$2"
+			shift 2
+			;;
 		-p | --poll-interval)
 			POLL_INTERVAL="$2"
 			shift 2
@@ -309,24 +340,31 @@ pid_file() {
 	printf '%s/%s.pid' "$RUNTIME_DIR" "$SINK_NAME"
 }
 
-# Write PID:MODULE_ID to the lock file.
+# Write PID:SINK_MODULE:SOURCE_MODULE to the lock file.
 write_pid_file() {
-	printf '%d:%s\n' "$$" "$MODULE_ID" >"$(pid_file)"
+	printf '%d:%s:%s\n' "$$" "$MODULE_ID" "$SOURCE_MODULE_ID" >"$(pid_file)"
 }
 
 remove_pid_file() {
 	rm -f "$(pid_file)"
 }
 
-# Read a PID file → sets _PF_PID and _PF_MODULE.
+# Read a PID file → sets _PF_PID, _PF_MODULE, and _PF_SRC_MOD.
+# Handles both old (PID:MODULE) and new (PID:MODULE:SOURCE) formats.
 read_pid_file() {
 	local file="$1"
-	_PF_PID="" _PF_MODULE=""
+	_PF_PID="" _PF_MODULE="" _PF_SRC_MOD=""
 	[[ -f "$file" ]] || return 1
-	local content
+	local content remainder
 	content=$(<"$file")
 	_PF_PID="${content%%:*}"
-	_PF_MODULE="${content#*:}"
+	remainder="${content#*:}"
+	_PF_MODULE="${remainder%%:*}"
+	if [[ "$remainder" == *:* ]]; then
+		_PF_SRC_MOD="${remainder#*:}"
+	else
+		_PF_SRC_MOD=""
+	fi
 	[[ -n "$_PF_PID" ]]
 }
 
@@ -346,9 +384,13 @@ acquire_lock() {
 				die "Sink '${SINK_NAME}' is already managed by PID ${_PF_PID}. Use a different --sink-name or run: $0 --stop ${SINK_NAME}"
 			else
 				warn "Found stale PID file for '${SINK_NAME}' (PID ${_PF_PID} is dead)"
-				# Clean up the orphaned sink if possible
+				# Clean up the orphaned modules if possible
+				if [[ -n "$_PF_SRC_MOD" && "$_PF_SRC_MOD" != "0" && "$_PF_SRC_MOD" != "" ]]; then
+					log "Unloading orphaned source module ${_PF_SRC_MOD} from previous crash"
+					pactl unload-module "$_PF_SRC_MOD" 2>/dev/null || true
+				fi
 				if [[ -n "$_PF_MODULE" && "$_PF_MODULE" != "0" && "$_PF_MODULE" != "" ]]; then
-					log "Unloading orphaned module ${_PF_MODULE} from previous crash"
+					log "Unloading orphaned sink module ${_PF_MODULE} from previous crash"
 					pactl unload-module "$_PF_MODULE" 2>/dev/null || true
 				fi
 				rm -f "$pf"
@@ -447,7 +489,10 @@ cmd_stop() {
 			warn "PID ${_PF_PID} did not exit; sending SIGKILL"
 			kill -KILL "$_PF_PID" 2>/dev/null || true
 			sleep 0.5
-			# Force-cleanup the sink since the process couldn't do it
+			# Force-cleanup the modules since the process couldn't do it
+			if [[ -n "$_PF_SRC_MOD" && "$_PF_SRC_MOD" != "0" ]]; then
+				pactl unload-module "$_PF_SRC_MOD" 2>/dev/null || true
+			fi
 			if [[ -n "$_PF_MODULE" && "$_PF_MODULE" != "0" ]]; then
 				pactl unload-module "$_PF_MODULE" 2>/dev/null || true
 			fi
@@ -557,6 +602,38 @@ remove_sink() {
 		log "Unloading virtual sink (module ${MODULE_ID})"
 		pactl unload-module "$MODULE_ID" 2>/dev/null || true
 		MODULE_ID=""
+	fi
+}
+
+# ─── virtual source management ──────────────────────────────────────────────
+
+# Create a virtual input device (source) backed by the sink's monitor.
+# Uses module-remap-source so apps can select it as a regular microphone.
+create_source() {
+	[[ "$CREATE_SOURCE" == true ]] || return 0
+
+	log "Creating virtual source: ${_B}${SOURCE_NAME}${_N} (${SOURCE_DESCRIPTION})"
+	SOURCE_MODULE_ID=$(pactl load-module module-remap-source \
+		source_name="$SOURCE_NAME" \
+		master="${SINK_NAME}.monitor" \
+		source_properties="device.description=\"${SOURCE_DESCRIPTION}\"" \
+		2>&1) || {
+		warn "Failed to load module-remap-source (virtual source unavailable)"
+		SOURCE_MODULE_ID=""
+		return 1
+	}
+	log "Loaded module-remap-source (id ${SOURCE_MODULE_ID})"
+	log "  Virtual source: ${_B}${SOURCE_NAME}${_N}"
+
+	# Update PID file with the source module ID
+	write_pid_file
+}
+
+remove_source() {
+	if [[ -n "$SOURCE_MODULE_ID" ]]; then
+		log "Unloading virtual source (module ${SOURCE_MODULE_ID})"
+		pactl unload-module "$SOURCE_MODULE_ID" 2>/dev/null || true
+		SOURCE_MODULE_ID=""
 	fi
 }
 
@@ -1060,6 +1137,7 @@ cleanup() {
 		done <<<"$leftover"
 	fi
 
+	remove_source
 	remove_sink
 	release_lock
 	log "Done."
@@ -1750,6 +1828,13 @@ tui_menu_config() {
 
 		printf '  %b[p]%b Poll interval:  %ss\n' "$_Y" "$_N" "$POLL_INTERVAL" >&2
 
+		printf '  %b[s]%b Source device:  ' "$_Y" "$_N" >&2
+		if [[ "$CREATE_SOURCE" == true ]]; then
+			printf '%bON%b (%s)\n' "$_G" "$_N" "$SOURCE_NAME" >&2
+		else
+			printf '%bOFF%b\n' "$_R" "$_N" >&2
+		fi
+
 		printf '\n' >&2
 		if ((${#INCLUDE[@]} > 0)); then
 			printf '  Include: %s\n' "${INCLUDE[*]}" >&2
@@ -1808,6 +1893,24 @@ tui_menu_config() {
 					move_stream_to_sink "$nn" || true
 				done
 				_tui_push_msg "Mute local → ON"
+			fi
+			;;
+		s | S)
+			if [[ "$CREATE_SOURCE" == true ]]; then
+				remove_source
+				CREATE_SOURCE=false
+				write_pid_file
+				_tui_push_msg "Source device → OFF"
+			else
+				CREATE_SOURCE=true
+				[[ -z "$SOURCE_NAME" || "$SOURCE_NAME" == "" ]] && SOURCE_NAME="${SINK_NAME}_input"
+				[[ -z "$SOURCE_DESCRIPTION" || "$SOURCE_DESCRIPTION" == "" ]] && SOURCE_DESCRIPTION="${SINK_DESCRIPTION} Input"
+				if create_source; then
+					_tui_push_msg "Source device → ON (${SOURCE_NAME})"
+				else
+					CREATE_SOURCE=false
+					_tui_push_msg "Failed to create source device"
+				fi
 			fi
 			;;
 		p | P)
@@ -1873,6 +1976,16 @@ tui_menu_info() {
 		printf '    Description:  %s\n' "$SINK_DESCRIPTION" >&2
 		printf '    Module ID:    %s\n' "${MODULE_ID:-(reused)}" >&2
 		printf '    PID:          %s\n' "$$" >&2
+		printf '\n' >&2
+
+		printf '  %bSource%b\n' "$_B" "$_N" >&2
+		if [[ "$CREATE_SOURCE" == true && -n "$SOURCE_MODULE_ID" ]]; then
+			printf '    Name:         %s\n' "$SOURCE_NAME" >&2
+			printf '    Description:  %s\n' "$SOURCE_DESCRIPTION" >&2
+			printf '    Module ID:    %s\n' "$SOURCE_MODULE_ID" >&2
+		else
+			printf '    %b(disabled — use -S or toggle in Config)%b\n' "$_D" "$_N" >&2
+		fi
 		printf '\n' >&2
 
 		printf '  %bRouting%b\n' "$_B" "$_N" >&2
@@ -2033,6 +2146,7 @@ main() {
 	log "Description:   ${SINK_DESCRIPTION}"
 	log "Auto-capture:  ${AUTO_CAPTURE}"
 	log "Mute local:    ${MUTE_LOCAL}"
+	log "Source device:  ${CREATE_SOURCE}"
 	if ((${#INCLUDE[@]} > 0)); then
 		log "Include:     ${INCLUDE[*]}"
 	elif ((${#EXCLUDE[@]} > 0)); then
@@ -2046,12 +2160,19 @@ main() {
 	trap cleanup EXIT
 	trap 'exit 0' INT TERM HUP
 
+	# Compute source name defaults if not explicitly set
+	if [[ "$CREATE_SOURCE" == true ]]; then
+		[[ -z "$SOURCE_NAME" ]] && SOURCE_NAME="${SINK_NAME}_input"
+		[[ -z "$SOURCE_DESCRIPTION" ]] && SOURCE_DESCRIPTION="${SINK_DESCRIPTION} Input"
+	fi
+
 	acquire_lock
 	# Write an initial PID file (MODULE_ID updated after sink creation)
 	write_pid_file
 
 	get_default_sink
 	create_sink
+	create_source
 	capture_existing_streams
 
 	log "───────────────────────────────────────"
@@ -2059,6 +2180,9 @@ main() {
 	log "Configure your capture software to use:"
 	log "  Sink / playback: ${_B}${SINK_NAME}${_N}"
 	log "  Monitor / source: ${_B}${SINK_NAME}.monitor${_N}"
+	if [[ "$CREATE_SOURCE" == true && -n "$SOURCE_MODULE_ID" ]]; then
+		log "  Input device:    ${_B}${SOURCE_NAME}${_N}"
+	fi
 	log "───────────────────────────────────────"
 
 	if [[ "$INTERACTIVE" == true ]]; then
