@@ -185,9 +185,9 @@ usage() {
 		"4. Capture software (Sunshine, OBS, ...) selects the virtual" \
 		"   sink or its monitor source as its audio input." \
 		"" \
-		"5. If --source is given, a module-remap-source is loaded that" \
-		"   exposes the sink's monitor as a regular input device," \
-		"   so applications like Discord can select it as a mic."
+		"5. If --source is given, a native PipeWire Audio/Source/Virtual" \
+		"   node is created and linked to the sink's monitor, exposing" \
+		"   it as a regular input device visible to all applications."
 
 	_usage_section "MULTIPLE INSTANCES" \
 		"You can run several instances simultaneously with different" \
@@ -386,8 +386,8 @@ acquire_lock() {
 				warn "Found stale PID file for '${SINK_NAME}' (PID ${_PF_PID} is dead)"
 				# Clean up the orphaned modules if possible
 				if [[ -n "$_PF_SRC_MOD" && "$_PF_SRC_MOD" != "0" && "$_PF_SRC_MOD" != "" ]]; then
-					log "Unloading orphaned source module ${_PF_SRC_MOD} from previous crash"
-					pactl unload-module "$_PF_SRC_MOD" 2>/dev/null || true
+					log "Destroying orphaned source node ${_PF_SRC_MOD} from previous crash"
+					pw-cli destroy "$_PF_SRC_MOD" 2>/dev/null || true
 				fi
 				if [[ -n "$_PF_MODULE" && "$_PF_MODULE" != "0" && "$_PF_MODULE" != "" ]]; then
 					log "Unloading orphaned sink module ${_PF_MODULE} from previous crash"
@@ -491,7 +491,7 @@ cmd_stop() {
 			sleep 0.5
 			# Force-cleanup the modules since the process couldn't do it
 			if [[ -n "$_PF_SRC_MOD" && "$_PF_SRC_MOD" != "0" ]]; then
-				pactl unload-module "$_PF_SRC_MOD" 2>/dev/null || true
+				pw-cli destroy "$_PF_SRC_MOD" 2>/dev/null || true
 			fi
 			if [[ -n "$_PF_MODULE" && "$_PF_MODULE" != "0" ]]; then
 				pactl unload-module "$_PF_MODULE" 2>/dev/null || true
@@ -501,6 +501,9 @@ cmd_stop() {
 		log "Stopped '${target}'"
 	else
 		warn "PID ${_PF_PID} is already dead (stale); cleaning up"
+		if [[ -n "$_PF_SRC_MOD" && "$_PF_SRC_MOD" != "0" ]]; then
+			pw-cli destroy "$_PF_SRC_MOD" 2>/dev/null || true
+		fi
 		if [[ -n "$_PF_MODULE" && "$_PF_MODULE" != "0" ]]; then
 			pactl unload-module "$_PF_MODULE" 2>/dev/null || true
 		fi
@@ -607,32 +610,62 @@ remove_sink() {
 
 # ─── virtual source management ──────────────────────────────────────────────
 
-# Create a virtual input device (source) backed by the sink's monitor.
-# Uses module-remap-source so apps can select it as a regular microphone.
+# Create a virtual input device (Audio/Source/Virtual) backed by the sink's
+# monitor.  Uses a native PipeWire node instead of module-remap-source so the
+# device appears with the correct description and with the HARDWARE flag,
+# making it visible to all applications (Audacity, Discord, OBS, etc.).
 create_source() {
 	[[ "$CREATE_SOURCE" == true ]] || return 0
 
+	# Clean up a stale node with the same name (crash without PID file)
+	local stale_id
+	stale_id=$(pw-dump 2>/dev/null | jq -r \
+		".[] | select(.info.props.\"node.name\" == \"${SOURCE_NAME}\") | .id" | head -1)
+	if [[ -n "$stale_id" ]]; then
+		warn "Source '${SOURCE_NAME}' already exists (node ${stale_id}) — destroying stale node"
+		pw-cli destroy "$stale_id" 2>/dev/null || true
+		sleep 0.3
+	fi
+
 	log "Creating virtual source: ${_B}${SOURCE_NAME}${_N} (${SOURCE_DESCRIPTION})"
-	SOURCE_MODULE_ID=$(pactl load-module module-remap-source \
-		source_name="$SOURCE_NAME" \
-		master="${SINK_NAME}.monitor" \
-		source_properties="device.description=\"${SOURCE_DESCRIPTION}\"" \
-		2>&1) || {
-		warn "Failed to load module-remap-source (virtual source unavailable)"
+	pw-cli create-node adapter \
+		"{ factory.name=support.null-audio-sink node.name=${SOURCE_NAME} node.description=\"${SOURCE_DESCRIPTION}\" media.class=Audio/Source/Virtual audio.position=[FL,FR] object.linger=true }" \
+		>/dev/null 2>&1 || {
+		warn "Failed to create virtual source node"
 		SOURCE_MODULE_ID=""
 		return 1
 	}
-	log "Loaded module-remap-source (id ${SOURCE_MODULE_ID})"
-	log "  Virtual source: ${_B}${SOURCE_NAME}${_N}"
 
-	# Update PID file with the source module ID
+	# Wait for the source's input ports to appear
+	local tries=0
+	while ! pw-link -i 2>/dev/null | grep -qF "${SOURCE_NAME}:input_FL"; do
+		((++tries > 40)) && {
+			warn "Virtual source ports never appeared"
+			SOURCE_MODULE_ID=""
+			return 1
+		}
+		sleep 0.1
+	done
+
+	# Retrieve the PipeWire node ID for later cleanup
+	SOURCE_MODULE_ID=$(pw-dump 2>/dev/null | jq -r \
+		".[] | select(.info.props.\"node.name\" == \"${SOURCE_NAME}\") | .id" | head -1)
+
+	# Link the sink's monitor output to the source's input
+	pw-link "${SINK_NAME}:monitor_FL" "${SOURCE_NAME}:input_FL" 2>/dev/null || true
+	pw-link "${SINK_NAME}:monitor_FR" "${SOURCE_NAME}:input_FR" 2>/dev/null || true
+
+	log "Created virtual source (node ${SOURCE_MODULE_ID})"
+	log "  Input device: ${_B}${SOURCE_NAME}${_N}"
+
+	# Update PID file with the source node ID
 	write_pid_file
 }
 
 remove_source() {
 	if [[ -n "$SOURCE_MODULE_ID" ]]; then
-		log "Unloading virtual source (module ${SOURCE_MODULE_ID})"
-		pactl unload-module "$SOURCE_MODULE_ID" 2>/dev/null || true
+		log "Destroying virtual source (node ${SOURCE_MODULE_ID})"
+		pw-cli destroy "$SOURCE_MODULE_ID" 2>/dev/null || true
 		SOURCE_MODULE_ID=""
 	fi
 }

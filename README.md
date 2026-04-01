@@ -289,10 +289,11 @@ instance's sink.
    the virtual sink. This cooperates with WirePlumber rather than fighting
    it, so there are no re-linking loops.
 
-4. If **`--source`** is given, a **`module-remap-source`** is loaded that
-   exposes the sink's monitor as a regular input device. Applications
-   like Discord, Zoom, or any program that selects a microphone can
-   pick this virtual source to receive the shared audio.
+4. If **`--source`** is given, a native PipeWire **`Audio/Source/Virtual`**
+   node is created and linked to the sink's monitor, exposing it as a
+   regular input device with the `HARDWARE` flag. This makes it visible
+   to all applications (Audacity, Discord, Zoom, OBS, etc.) as a
+   selectable microphone.
 
 5. A **polling loop** (configurable interval, default 2s) continuously:
    - Discovers new streams and captures them (if auto-capture is on)
