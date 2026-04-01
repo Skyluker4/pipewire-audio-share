@@ -45,13 +45,13 @@ ORIGINAL_DEFAULT_SOURCE="" # saved when --default-source is used; restored on ex
 STARTUP_DEFAULT_SINK=""    # captured once; used only as a last resort
 CLEANUP_DONE=false
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/pipewire-audio-share"
-declare -A CAPTURED=()        # node_name → "1"  (streams we are managing)
-declare -A SKIPPED=()         # node_name → "1"  (streams we skipped, e.g. peer-owned)
+declare -A CAPTURED=()        # node_id → node_name  (streams we are managing)
+declare -A SKIPPED=()         # node_id → "1"  (streams we skipped, e.g. peer-owned)
 declare -A MOVED_INPUTS=()    # pactl_index → original_sink  (for mute-local restore)
-declare -A OUR_LINKS=()       # "out_port|in_port" → 1  (links WE created via pw-link)
+declare -A OUR_LINKS=()       # "out_port_id|in_port_id" → 1  (links WE created)
 declare -A CAPTURED_INPUTS=() # node_name → "1"  (input devices routed to our sink)
-declare -A MANUAL_ADD=()      # node_name → "1"  (user explicitly added via TUI)
-declare -A MANUAL_REMOVE=()   # node_name → "1"  (user explicitly removed via TUI)
+declare -A MANUAL_ADD=()      # node_id → "1"  (user explicitly added via TUI)
+declare -A MANUAL_REMOVE=()   # node_id → "1"  (user explicitly removed via TUI)
 declare -i SKIP_RETRY_CTR=0   # cycle counter for periodic SKIPPED re-evaluation
 SKIP_RETRY_EVERY=15           # retry skipped streams every N poll cycles (~30s at 2s poll)
 TUI_ACTIVE=false              # true while the interactive TUI owns the screen
@@ -738,51 +738,75 @@ input_matches_route() {
 }
 
 # Link an input device's capture ports to our virtual sink.
+# Uses port IDs for linking, same as stream linking.
 link_input_to_sink() {
 	local node_name="$1"
 	local linked=false
 
+	local dump
+	dump=$(pw-dump 2>/dev/null) || return 1
+
+	# Find the input device's node ID
+	local dev_nid
+	dev_nid=$(jq -r --arg n "$node_name" '
+		[.[] | select(.info.props."node.name" == $n) | .id] | .[0] // empty
+	' <<<"$dump")
+	[[ -z "$dev_nid" ]] && {
+		debug "Node not found: ${node_name}"
+		return 1
+	}
+
+	# Get its output (capture) port IDs
 	local cap_ports
-	cap_ports=$(pw-link -o 2>/dev/null | grep "^${node_name}:capture_" || true)
+	cap_ports=$(jq -r --argjson nid "$dev_nid" '
+		.[] | select(.type == "PipeWire:Interface:Port"
+			and .info.direction == "output"
+			and .info.props."node.id" == $nid)
+		| "\(.id)\t\(.info.props."port.name")"
+	' <<<"$dump")
 	[[ -z "$cap_ports" ]] && {
 		debug "No capture ports for ${node_name}"
 		return 1
 	}
 
-	local cap_port
-	while IFS= read -r cap_port; do
-		local channel="${cap_port##*capture_}"
+	# Sink input ports: channel → port_id
+	local -A sink_ch=()
+	_build_sink_ch_map dump sink_ch || return 1
+
+	local cap_id cap_name
+	while IFS=$'\t' read -r cap_id cap_name; do
+		[[ -z "$cap_id" ]] && continue
+		local channel="${cap_name##*capture_}"
 
 		if [[ "$channel" == "MONO" ]]; then
-			# Mono input → link to both FL and FR
-			local in_port
-			for in_port in "${SINK_NAME}:playback_FL" "${SINK_NAME}:playback_FR"; do
+			local target
+			for target in "playback_FL" "playback_FR"; do
+				local in_id="${sink_ch[$target]:-}"
+				[[ -z "$in_id" ]] && continue
 				local link_err
-				if link_err=$(pw-link -- "$cap_port" "$in_port" 2>&1); then
-					log "  Linked ${cap_port} → ${in_port}"
-					OUR_LINKS["${cap_port}|${in_port}"]=1
+				if link_err=$(pw-link "$cap_id" "$in_id" 2>&1); then
+					log "  Linked port ${cap_id} → ${in_id}"
+					OUR_LINKS["${cap_id}|${in_id}"]=1
 					linked=true
 				elif [[ "$link_err" == *"File exists"* ]]; then
 					linked=true
 				else
-					warn "  Failed to link ${cap_port} → ${in_port}: ${link_err}"
+					warn "  Failed to link port ${cap_id} → ${in_id}: ${link_err}"
 				fi
 			done
 		else
-			# Stereo channel → match FL→FL, FR→FR
-			local in_port="${SINK_NAME}:playback_${channel}"
-			if ! pw-link -i 2>/dev/null | grep -qxF "$in_port"; then
-				in_port="${SINK_NAME}:playback_FL"
-			fi
+			local in_id="${sink_ch["playback_${channel}"]:-}"
+			[[ -z "$in_id" ]] && in_id="${sink_ch["playback_FL"]:-}"
+			[[ -z "$in_id" ]] && continue
 			local link_err
-			if link_err=$(pw-link -- "$cap_port" "$in_port" 2>&1); then
-				log "  Linked ${cap_port} → ${in_port}"
-				OUR_LINKS["${cap_port}|${in_port}"]=1
+			if link_err=$(pw-link "$cap_id" "$in_id" 2>&1); then
+				log "  Linked port ${cap_id} → ${in_id}"
+				OUR_LINKS["${cap_id}|${in_id}"]=1
 				linked=true
 			elif [[ "$link_err" == *"File exists"* ]]; then
 				linked=true
 			else
-				warn "  Failed to link ${cap_port} → ${in_port}: ${link_err}"
+				warn "  Failed to link port ${cap_id} → ${in_id}: ${link_err}"
 			fi
 		fi
 	done <<<"$cap_ports"
@@ -793,14 +817,30 @@ link_input_to_sink() {
 # Remove links WE created from an input device to our sink.
 unlink_input_from_sink() {
 	local node_name="$1"
-	local key out_port in_port link_err
 	local count=0
+
+	# Find the device's port IDs for lookup
+	local dev_nid
+	dev_nid=$(pw-dump 2>/dev/null | jq -r --arg n "$node_name" '
+		[.[] | select(.info.props."node.name" == $n) | .id] | .[0] // empty')
+	local -A _dev_ports=()
+	if [[ -n "$dev_nid" ]]; then
+		local _pid
+		while IFS= read -r _pid; do
+			[[ -n "$_pid" ]] && _dev_ports["$_pid"]=1
+		done < <(pw-dump 2>/dev/null | jq -r --argjson nid "$dev_nid" '
+			.[] | select(.type == "PipeWire:Interface:Port"
+				and .info.direction == "output"
+				and .info.props."node.id" == $nid) | .id')
+	fi
+
+	local key out_id in_id link_err
 	for key in "${!OUR_LINKS[@]}"; do
-		out_port="${key%%|*}"
-		in_port="${key#*|}"
-		[[ "$out_port" == "${node_name}:capture_"* ]] || continue
-		if link_err=$(pw-link -d "$out_port" "$in_port" 2>&1); then
-			log "  Unlinked ${out_port} → ${in_port}"
+		out_id="${key%%|*}"
+		in_id="${key#*|}"
+		[[ -v "_dev_ports[$out_id]" ]] || continue
+		if link_err=$(pw-link -d "$out_id" "$in_id" 2>&1); then
+			log "  Unlinked port ${out_id} → ${in_id}"
 			((++count)) || true
 		fi
 		unset "OUR_LINKS[$key]"
@@ -833,15 +873,17 @@ route_input_devices() {
 # ─── stream discovery ───────────────────────────────────────────────────────
 
 # Emit one JSON object per audio output stream:
-#   { "node_name": "…", "app_name": "…", "serial": 123 }
+#   { "id": 190, "node_name": "…", "app_name": "…", "media_name": "…", "serial": 123 }
 get_audio_streams() {
 	pw-dump 2>/dev/null | jq -c '
 		[ .[]
 			| select(.info.props."media.class" == "Stream/Output/Audio")
 			| {
-				node_name:  .info.props."node.name",
-				app_name:  (.info.props."application.name" // ""),
-				serial:    (.info.props."object.serial" // 0)
+				id:          .id,
+				node_name:   .info.props."node.name",
+				app_name:   (.info.props."application.name" // ""),
+				media_name: (.info.props."media.name" // ""),
+				serial:     (.info.props."object.serial" // 0)
 			}
 		] | .[]
 	' 2>/dev/null
@@ -851,13 +893,13 @@ get_audio_streams() {
 
 # Returns 0 (true) when the stream should be captured.
 stream_matches_filter() {
-	local node_name="$1" app_name="$2"
+	local node_name="$1" app_name="$2" media_name="${3:-}"
 
 	# Never capture our own sink
 	[[ "$node_name" == "${SINK_NAME}"* ]] && return 1
 
-	# Build a lower-cased haystack from both identifiers
-	local haystack="${node_name,,} ${app_name,,}"
+	# Build a lower-cased haystack from all identifiers
+	local haystack="${node_name,,} ${app_name,,} ${media_name,,}"
 
 	# ── include mode ──
 	if ((${#INCLUDE[@]} > 0)); then
@@ -887,61 +929,65 @@ stream_matches_filter() {
 
 # ─── linking helpers ─────────────────────────────────────────────────────────
 
-# Check whether an explicit pw-link from $1 → $2 already exists.
-link_exists() {
-	local out="$1" in="$2"
-	pw-link -l 2>/dev/null | awk -v out="$out" -v inp="$in" '
-		BEGIN              { rc = 1 }
-		$0 == out          { found = 1; next }
-		found && /^\s/     { gsub(/^\s+\|-> /, ""); if ($0 == inp) { rc = 0; exit }; next }
-		found && !/^\s/    { found = 0 }
-		END                { exit rc }
-	'
-}
+# ─── PipeWire port-ID helpers ───────────────────────────────────────────────
+# All pw-link operations use numeric port IDs to avoid ambiguity when
+# multiple nodes share the same node.name (e.g. two mpv instances).
 
-# Resolve the virtual-sink playback port that should receive a given channel.
-# Falls back to playback_FL for MONO or unrecognised suffixes.
-resolve_sink_port() {
-	local channel="$1"
-	local candidate="${SINK_NAME}:playback_${channel}"
-	if pw-link -i 2>/dev/null | grep -qxF "$candidate"; then
-		printf '%s' "$candidate"
-		return 0
-	fi
-	# fallback
-	candidate="${SINK_NAME}:playback_FL"
-	if pw-link -i 2>/dev/null | grep -qxF "$candidate"; then
-		printf '%s' "$candidate"
-		return 0
-	fi
-	return 1
+# Build a sink-port channel lookup from a cached pw-dump.
+# Sets entries in the caller's associative array variable (passed by nameref).
+# Usage: _build_sink_ch_map dump_var map_var
+_build_sink_ch_map() {
+	local -n _dump_ref=$1 _map_ref=$2
+	local sink_nid
+	sink_nid=$(jq -r --arg name "$SINK_NAME" '
+		[.[] | select(.info.props."node.name" == $name) | .id] | .[0] // empty
+	' <<<"$_dump_ref")
+	[[ -z "$sink_nid" ]] && return 1
+	local _pid _pname
+	while IFS=$'\t' read -r _pid _pname; do
+		[[ -n "$_pid" ]] && _map_ref["$_pname"]="$_pid"
+	done < <(jq -r --argjson nid "$sink_nid" '
+		.[] | select(.type == "PipeWire:Interface:Port"
+			and .info.direction == "input"
+			and .info.props."node.id" == $nid)
+		| "\(.id)\t\(.info.props."port.name")"
+	' <<<"$_dump_ref")
 }
 
 # Remove only the pw-links that WE created (tracked in OUR_LINKS) from a
 # stream's output ports to our virtual sink.  Links that WirePlumber or other
 # software created (e.g. routing to our sink because it is the default) are
 # left intact so local playback is not disrupted.
+# Takes a PipeWire node object.id (numeric).
 # Sets _UNLINK_COUNT to the number of links actually removed.
 _UNLINK_COUNT=0
 unlink_stream_from_sink() {
-	local node_name="$1"
+	local node_id="$1"
 	_UNLINK_COUNT=0
 
-	local key out_port in_port link_err
+	# Build a set of this node's output port IDs for fast lookup
+	local -A _node_ports=()
+	local _pid
+	while IFS= read -r _pid; do
+		[[ -n "$_pid" ]] && _node_ports["$_pid"]=1
+	done < <(pw-dump 2>/dev/null | jq -r --argjson nid "$node_id" '
+		.[] | select(.type == "PipeWire:Interface:Port"
+			and .info.direction == "output"
+			and .info.props."node.id" == $nid) | .id
+	')
+
+	local key out_id in_id link_err
 	for key in "${!OUR_LINKS[@]}"; do
-		out_port="${key%%|*}"
-		in_port="${key#*|}"
+		out_id="${key%%|*}"
+		in_id="${key#*|}"
+		[[ -v "_node_ports[$out_id]" ]] || continue
 
-		# Only process links belonging to the requested stream
-		[[ "$out_port" == "${node_name}:output_"* ]] || continue
-
-		if link_err=$(pw-link -d "$out_port" "$in_port" 2>&1); then
-			log "  Unlinked ${out_port} → ${in_port}"
+		if link_err=$(pw-link -d "$out_id" "$in_id" 2>&1); then
+			log "  Unlinked port ${out_id} → ${in_id}"
 			((_UNLINK_COUNT++)) || true
 		else
-			# Link may already be gone (stream closed, etc.) — not an error.
 			if [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
-				warn "  Failed to unlink ${out_port} → ${in_port}: ${link_err}"
+				warn "  Failed to unlink port ${out_id} → ${in_id}: ${link_err}"
 			fi
 		fi
 		unset "OUR_LINKS[$key]"
@@ -949,45 +995,62 @@ unlink_stream_from_sink() {
 }
 
 # Create additional pw-links from a stream's output ports to our sink.
+# Takes a PipeWire node object.id (numeric).  Uses port IDs for linking
+# so that multiple nodes with the same node.name are handled correctly.
 # This does NOT remove the WirePlumber-managed link to the default sink.
 link_stream_to_sink() {
-	local node_name="$1"
+	local node_id="$1"
 	local linked=false
 
+	local dump
+	dump=$(pw-dump 2>/dev/null) || return 1
+
+	# Output ports for this specific node
 	local out_ports
-	out_ports=$(pw-link -o 2>/dev/null | grep "^${node_name}:output_" || true)
+	out_ports=$(jq -r --argjson nid "$node_id" '
+		.[] | select(.type == "PipeWire:Interface:Port"
+			and .info.direction == "output"
+			and .info.props."node.id" == $nid)
+		| "\(.id)\t\(.info.props."port.name")"
+	' <<<"$dump")
 	[[ -z "$out_ports" ]] && {
-		debug "No output ports for ${node_name}"
+		debug "No output ports for node ${node_id}"
 		return 1
 	}
 
-	while IFS= read -r out_port; do
-		local channel="${out_port##*output_}"
-		local in_port
-		in_port=$(resolve_sink_port "$channel") || {
-			warn "  No sink port for channel ${channel}"
-			continue
-		}
+	# Sink input ports: channel → port_id
+	local -A sink_ch=()
+	_build_sink_ch_map dump sink_ch || {
+		warn "  Sink port lookup failed"
+		return 1
+	}
 
-		if link_exists "$out_port" "$in_port"; then
-			debug "  Link already present: ${out_port} → ${in_port}"
+	local out_id out_name
+	while IFS=$'\t' read -r out_id out_name; do
+		[[ -z "$out_id" ]] && continue
+		local channel="${out_name##*output_}"
+
+		# Match to sink port by channel; MONO falls back to FL
+		local in_id="${sink_ch["playback_${channel}"]:-}"
+		[[ -z "$in_id" ]] && in_id="${sink_ch["playback_FL"]:-}"
+		[[ -z "$in_id" ]] && continue
+
+		# Already tracked by us?
+		if [[ -v "OUR_LINKS[${out_id}|${in_id}]" ]]; then
 			linked=true
 			continue
 		fi
 
 		local link_err
-		if link_err=$(pw-link -- "$out_port" "$in_port" 2>&1); then
-			log "  Linked ${out_port} → ${in_port}"
-			OUR_LINKS["${out_port}|${in_port}"]=1
+		if link_err=$(pw-link "$out_id" "$in_id" 2>&1); then
+			log "  Linked port ${out_id} → ${in_id}"
+			OUR_LINKS["${out_id}|${in_id}"]=1
+			linked=true
+		elif [[ "$link_err" == *"File exists"* ]]; then
+			debug "  Link already present: port ${out_id} → ${in_id}"
 			linked=true
 		else
-			# May already exist (race) — treat "File exists" as success
-			if [[ "$link_err" == *"File exists"* ]] || link_exists "$out_port" "$in_port"; then
-				debug "  Link already present (confirmed): ${out_port} → ${in_port}"
-				linked=true
-			else
-				warn "  Failed to link ${out_port} → ${in_port}: ${link_err}"
-			fi
+			warn "  Failed to link port ${out_id} → ${in_id}: ${link_err}"
 		fi
 	done <<<"$out_ports"
 
@@ -1125,7 +1188,7 @@ restore_stream_from_sink() {
 # ─── high-level capture / release ────────────────────────────────────────────
 
 capture_stream() {
-	local node_name="$1" app_name="$2"
+	local node_id="$1" node_name="$2" app_name="$3"
 
 	if [[ "$MUTE_LOCAL" == true ]]; then
 		# Check peer ownership to avoid fighting another instance
@@ -1135,13 +1198,13 @@ capture_stream() {
 		fi
 		# Move exclusively to virtual sink (no local playback).
 		if move_stream_to_sink "$node_name"; then
-			CAPTURED["$node_name"]=1
+			CAPTURED["$node_id"]="$node_name"
 			return 0
 		fi
 	else
 		# Add supplementary link; local playback continues via WirePlumber.
-		if link_stream_to_sink "$node_name"; then
-			CAPTURED["$node_name"]=1
+		if link_stream_to_sink "$node_id"; then
+			CAPTURED["$node_id"]="$node_name"
 			return 0
 		fi
 	fi
@@ -1149,14 +1212,15 @@ capture_stream() {
 }
 
 release_stream() {
-	local node_name="$1"
+	local node_id="$1"
+	local node_name="${CAPTURED[$node_id]:-}"
 	if [[ "$MUTE_LOCAL" == true ]]; then
-		restore_stream_from_sink "$node_name"
+		[[ -n "$node_name" ]] && restore_stream_from_sink "$node_name"
 	else
 		# Remove the supplementary pw-links to our virtual sink.
-		unlink_stream_from_sink "$node_name"
+		unlink_stream_from_sink "$node_id"
 	fi
-	unset "CAPTURED[$node_name]"
+	unset "CAPTURED[$node_id]"
 }
 
 # ─── bulk operations ─────────────────────────────────────────────────────────
@@ -1167,14 +1231,16 @@ capture_existing_streams() {
 
 	while IFS= read -r obj; do
 		[[ -z "$obj" ]] && continue
-		local node_name app_name
+		local nid node_name app_name media_name
+		nid=$(jq -r '.id // empty' <<<"$obj")
 		node_name=$(jq -r '.node_name // empty' <<<"$obj")
 		app_name=$(jq -r '.app_name // empty' <<<"$obj")
-		[[ -z "$node_name" ]] && continue
+		media_name=$(jq -r '.media_name // empty' <<<"$obj")
+		[[ -z "$nid" || -z "$node_name" ]] && continue
 
-		if stream_matches_filter "$node_name" "$app_name"; then
+		if stream_matches_filter "$node_name" "$app_name" "$media_name"; then
 			log "Capturing: ${_B}${app_name:-$node_name}${_N}  (${node_name})"
-			capture_stream "$node_name" "$app_name" && ((++count))
+			capture_stream "$nid" "$node_name" "$app_name" && ((++count))
 		else
 			debug "Filtered out: ${app_name:-$node_name} (${node_name})"
 		fi
@@ -1187,31 +1253,33 @@ capture_existing_streams() {
 scan_new_streams() {
 	while IFS= read -r obj; do
 		[[ -z "$obj" ]] && continue
-		local node_name app_name
+		local nid node_name app_name media_name
+		nid=$(jq -r '.id // empty' <<<"$obj")
 		node_name=$(jq -r '.node_name // empty' <<<"$obj")
 		app_name=$(jq -r '.app_name // empty' <<<"$obj")
-		[[ -z "$node_name" ]] && continue
+		media_name=$(jq -r '.media_name // empty' <<<"$obj")
+		[[ -z "$nid" || -z "$node_name" ]] && continue
 
 		# Already tracked (captured or previously skipped)?
-		[[ -v "CAPTURED[$node_name]" ]] && continue
-		[[ -v "SKIPPED[$node_name]" ]] && continue
+		[[ -v "CAPTURED[$nid]" ]] && continue
+		[[ -v "SKIPPED[$nid]" ]] && continue
 		# User explicitly removed this stream via interactive menu?
-		[[ -v "MANUAL_REMOVE[$node_name]" ]] && continue
+		[[ -v "MANUAL_REMOVE[$nid]" ]] && continue
 
 		# Manual add overrides filter
-		if [[ -v "MANUAL_ADD[$node_name]" ]]; then
+		if [[ -v "MANUAL_ADD[$nid]" ]]; then
 			log "Auto-capturing manually added stream: ${_B}${app_name:-$node_name}${_N}"
-			if ! capture_stream "$node_name" "$app_name"; then
-				SKIPPED["$node_name"]=1
+			if ! capture_stream "$nid" "$node_name" "$app_name"; then
+				SKIPPED["$nid"]=1
 			fi
 			continue
 		fi
 
-		if stream_matches_filter "$node_name" "$app_name"; then
+		if stream_matches_filter "$node_name" "$app_name" "$media_name"; then
 			log "New stream: ${_B}${app_name:-$node_name}${_N}  (${node_name})"
-			if ! capture_stream "$node_name" "$app_name"; then
+			if ! capture_stream "$nid" "$node_name" "$app_name"; then
 				# Remember we skipped it so we don't log every poll cycle
-				SKIPPED["$node_name"]=1
+				SKIPPED["$nid"]=1
 			fi
 		fi
 	done < <(get_audio_streams)
@@ -1221,11 +1289,23 @@ scan_new_streams() {
 verify_existing_links() {
 	local stale=()
 
-	for node_name in "${!CAPTURED[@]}"; do
-		# Has the stream vanished entirely?
-		if ! pw-link -o 2>/dev/null | grep -q "^${node_name}:"; then
-			debug "Stream gone: ${node_name}"
-			stale+=("$node_name")
+	# Cache pw-dump once for all checks this cycle
+	local _vdump
+	_vdump=$(pw-dump 2>/dev/null)
+
+	for node_id in "${!CAPTURED[@]}"; do
+		local node_name="${CAPTURED[$node_id]}"
+
+		# Has the stream vanished entirely?  Check if node still has ports.
+		local _pcnt
+		_pcnt=$(jq --argjson nid "$node_id" '
+			[.[] | select(.type == "PipeWire:Interface:Port"
+				and .info.direction == "output"
+				and .info.props."node.id" == $nid)] | length
+		' <<<"$_vdump")
+		if [[ "${_pcnt:-0}" == "0" ]]; then
+			debug "Stream gone: ${node_name} (node ${node_id})"
+			stale+=("$node_id")
 			continue
 		fi
 
@@ -1244,7 +1324,7 @@ verify_existing_links() {
 					# Check if another instance now owns it
 					if stream_owned_by_peer "$node_name"; then
 						debug "Stream ${node_name} was taken by a peer; releasing"
-						stale+=("$node_name")
+						stale+=("$node_id")
 						continue 2
 					fi
 					debug "Re-moving ${node_name} (sink-input #${idx}) back to ${SINK_NAME}"
@@ -1254,34 +1334,33 @@ verify_existing_links() {
 			done <<<"$entries"
 		else
 			# Non-mute: verify the supplementary link still exists.
-			link_stream_to_sink "$node_name" 2>/dev/null || true
+			link_stream_to_sink "$node_id" 2>/dev/null || true
 		fi
 	done
 
-	for node_name in "${stale[@]}"; do
-		unset "CAPTURED[$node_name]"
-		unset "MOVED_INPUTS[$node_name]" 2>/dev/null || true
+	for node_id in "${stale[@]}"; do
+		unset "CAPTURED[$node_id]"
 	done
 
 	# Re-evaluate previously skipped streams.
 	((++SKIP_RETRY_CTR))
-	for node_name in "${!SKIPPED[@]}"; do
+	for node_id in "${!SKIPPED[@]}"; do
 		# Stream gone? Drop the skip so it's retried if it reappears.
-		if ! pw-link -o 2>/dev/null | grep -q "^${node_name}:"; then
-			unset "SKIPPED[$node_name]"
+		local _pcnt
+		_pcnt=$(jq --argjson nid "$node_id" '
+			[.[] | select(.type == "PipeWire:Interface:Port"
+				and .info.direction == "output"
+				and .info.props."node.id" == $nid)] | length
+		' <<<"$_vdump")
+		if [[ "${_pcnt:-0}" == "0" ]]; then
+			unset "SKIPPED[$node_id]"
 			continue
 		fi
 		# In mute-local mode, retry if the owning peer released it.
-		if [[ "$MUTE_LOCAL" == true ]] && ! stream_owned_by_peer "$node_name"; then
-			debug "Peer released ${node_name}; will retry capture"
-			unset "SKIPPED[$node_name]"
-			continue
-		fi
-		# Periodic retry: clear the skip every N cycles in case a transient
-		# failure (PipeWire hiccup, stream recreation) has resolved.
+		# (peer check still uses node_name from get_audio_streams context)
 		if ((SKIP_RETRY_CTR >= SKIP_RETRY_EVERY)); then
-			debug "Periodic retry for skipped stream: ${node_name}"
-			unset "SKIPPED[$node_name]"
+			debug "Periodic retry for skipped stream: node ${node_id}"
+			unset "SKIPPED[$node_id]"
 		fi
 	done
 	if ((SKIP_RETRY_CTR >= SKIP_RETRY_EVERY)); then
@@ -1324,7 +1403,8 @@ cleanup() {
 		log "Restoring streams to default output …"
 		local live_default
 		live_default=$(current_default_sink)
-		for node_name in "${!CAPTURED[@]}"; do
+		for nid in "${!CAPTURED[@]}"; do
+			local node_name="${CAPTURED[$nid]}"
 			restore_stream_from_sink "$node_name"
 		done
 
@@ -1565,7 +1645,7 @@ tui_get_input_idx() {
 }
 
 # Collect all audio streams as an indexed bash array of tab-separated records:
-#   node_name \t app_name \t status
+#   node_id \t node_name \t app_name \t status \t media_name
 # Status: captured | available | filtered | removed | skipped
 # Sets: _TUI_STREAMS=( ... ) and _TUI_STREAM_COUNT
 declare -a _TUI_STREAMS=()
@@ -1576,24 +1656,26 @@ tui_refresh_streams() {
 	_TUI_STREAM_COUNT=0
 	while IFS= read -r obj; do
 		[[ -z "$obj" ]] && continue
-		local nn an
+		local nid nn an mn
+		nid=$(jq -r '.id // empty' <<<"$obj")
 		nn=$(jq -r '.node_name // empty' <<<"$obj")
 		an=$(jq -r '.app_name  // empty' <<<"$obj")
-		[[ -z "$nn" ]] && continue
+		mn=$(jq -r '.media_name // empty' <<<"$obj")
+		[[ -z "$nid" || -z "$nn" ]] && continue
 		[[ "$nn" == "${SINK_NAME}"* ]] && continue
 
 		local st="available"
-		if [[ -v "CAPTURED[$nn]" ]]; then
+		if [[ -v "CAPTURED[$nid]" ]]; then
 			st="captured"
-		elif [[ -v "MANUAL_REMOVE[$nn]" ]]; then
+		elif [[ -v "MANUAL_REMOVE[$nid]" ]]; then
 			st="removed"
-		elif [[ -v "SKIPPED[$nn]" ]]; then
+		elif [[ -v "SKIPPED[$nid]" ]]; then
 			st="skipped"
-		elif ! stream_matches_filter "$nn" "$an"; then
+		elif ! stream_matches_filter "$nn" "$an" "$mn"; then
 			st="filtered"
 		fi
 
-		_TUI_STREAMS+=("${nn}	${an}	${st}")
+		_TUI_STREAMS+=("${nid}	${nn}	${an}	${st}	${mn}")
 		((++_TUI_STREAM_COUNT))
 	done < <(get_audio_streams)
 }
@@ -1632,9 +1714,12 @@ tui_menu_streams() {
 			local i
 			for ((i = 0; i < _TUI_STREAM_COUNT; i++)); do
 				local rec="${_TUI_STREAMS[$i]}"
-				local nn an st
-				IFS=$'\t' read -r nn an st <<<"$rec"
+				local nid nn an st mn
+				IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 				local label="${an:-$nn}"
+				if [[ -n "$mn" && "$mn" != "$an" && "$mn" != "$nn" ]]; then
+					label="${label} — ${mn}"
+				fi
 
 				local marker color suffix
 				case "$st" in
@@ -1706,22 +1791,22 @@ tui_menu_streams() {
 		' ' | ENTER)
 			((_TUI_STREAM_COUNT > 0)) || continue
 			local rec="${_TUI_STREAMS[$sel]}"
-			local nn an st
-			IFS=$'\t' read -r nn an st <<<"$rec"
+			local nid nn an st mn
+			IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 			if [[ "$st" == "captured" ]]; then
-				release_stream "$nn"
-				MANUAL_REMOVE["$nn"]=1
-				unset "MANUAL_ADD[$nn]"
+				release_stream "$nid"
+				MANUAL_REMOVE["$nid"]=1
+				unset "MANUAL_ADD[$nid]"
 				if ((_UNLINK_COUNT > 0)); then
 					_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
 				else
 					_tui_push_msg "Released: ${an:-$nn} (no links found to remove!)"
 				fi
 			else
-				unset "MANUAL_REMOVE[$nn]"
-				unset "SKIPPED[$nn]"
-				MANUAL_ADD["$nn"]=1
-				capture_stream "$nn" "${an:-}" || _tui_push_msg "Could not capture: ${an:-$nn}"
+				unset "MANUAL_REMOVE[$nid]"
+				unset "SKIPPED[$nid]"
+				MANUAL_ADD["$nid"]=1
+				capture_stream "$nid" "$nn" "${an:-}" || _tui_push_msg "Could not capture: ${an:-$nn}"
 			fi
 			;;
 		[1-9])
@@ -1729,22 +1814,22 @@ tui_menu_streams() {
 			if ((idx < _TUI_STREAM_COUNT)); then
 				sel=$idx
 				local rec="${_TUI_STREAMS[$sel]}"
-				local nn an st
-				IFS=$'\t' read -r nn an st <<<"$rec"
+				local nid nn an st mn
+				IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 				if [[ "$st" == "captured" ]]; then
-					release_stream "$nn"
-					MANUAL_REMOVE["$nn"]=1
-					unset "MANUAL_ADD[$nn]"
+					release_stream "$nid"
+					MANUAL_REMOVE["$nid"]=1
+					unset "MANUAL_ADD[$nid]"
 					if ((_UNLINK_COUNT > 0)); then
 						_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
 					else
 						_tui_push_msg "Released: ${an:-$nn} (no links found!)"
 					fi
 				else
-					unset "MANUAL_REMOVE[$nn]"
-					unset "SKIPPED[$nn]"
-					MANUAL_ADD["$nn"]=1
-					capture_stream "$nn" "${an:-}" || true
+					unset "MANUAL_REMOVE[$nid]"
+					unset "SKIPPED[$nid]"
+					MANUAL_ADD["$nid"]=1
+					capture_stream "$nid" "$nn" "${an:-}" || _tui_push_msg "Could not capture: ${an:-$nn}"
 				fi
 			fi
 			;;
@@ -1753,23 +1838,23 @@ tui_menu_streams() {
 			local i
 			for ((i = 0; i < _TUI_STREAM_COUNT; i++)); do
 				local rec="${_TUI_STREAMS[$i]}"
-				local nn an st
-				IFS=$'\t' read -r nn an st <<<"$rec"
+				local nid nn an st mn
+				IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 				if [[ "$st" != "captured" ]]; then
-					unset "MANUAL_REMOVE[$nn]"
-					unset "SKIPPED[$nn]"
-					MANUAL_ADD["$nn"]=1
-					capture_stream "$nn" "${an:-}" || true
+					unset "MANUAL_REMOVE[$nid]"
+					unset "SKIPPED[$nid]"
+					MANUAL_ADD["$nid"]=1
+					capture_stream "$nid" "$nn" "${an:-}" || true
 				fi
 			done
 			_tui_push_msg "Added all streams"
 			;;
 		r | R)
 			local total_unlinked=0
-			for nn in "${!CAPTURED[@]}"; do
-				release_stream "$nn"
-				MANUAL_REMOVE["$nn"]=1
-				unset "MANUAL_ADD[$nn]"
+			for nid in "${!CAPTURED[@]}"; do
+				release_stream "$nid"
+				MANUAL_REMOVE["$nid"]=1
+				unset "MANUAL_ADD[$nid]"
 				((total_unlinked += _UNLINK_COUNT)) || true
 			done
 			_tui_push_msg "Released all streams (${total_unlinked} links removed)"
@@ -1799,23 +1884,30 @@ tui_menu_volume() {
 		vol_types+=("sink")
 		vol_idxs+=("$SINK_NAME")
 
-		for nn in "${!CAPTURED[@]}"; do
-			local an="" idx=""
+		for nid in "${!CAPTURED[@]}"; do
+			local nn="${CAPTURED[$nid]}"
+			local an="" mn="" idx=""
 			# Get a display name from the current stream data
 			while IFS= read -r obj; do
 				[[ -z "$obj" ]] && continue
-				local n a
+				local n a m
 				n=$(jq -r '.node_name // empty' <<<"$obj")
 				a=$(jq -r '.app_name  // empty' <<<"$obj")
+				m=$(jq -r '.media_name // empty' <<<"$obj")
 				if [[ "$n" == "$nn" ]]; then
 					an="$a"
+					mn="$m"
 					break
 				fi
 			done < <(get_audio_streams)
 			idx=$(tui_get_input_idx "$nn")
 			[[ -z "$idx" ]] && continue
 			vol_names+=("$nn")
-			vol_labels+=("${an:-$nn}")
+			local vlabel="${an:-$nn}"
+			if [[ -n "$mn" && "$mn" != "$an" && "$mn" != "$nn" ]]; then
+				vlabel="${vlabel} — ${mn}"
+			fi
+			vol_labels+=("$vlabel")
 			vol_types+=("input")
 			vol_idxs+=("$idx")
 		done
@@ -2003,18 +2095,18 @@ tui_menu_output() {
 			;;
 		m | M)
 			if [[ "$MUTE_LOCAL" == true ]]; then
-				# Switching OFF: restore all captured streams to default
-				for nn in "${!CAPTURED[@]}"; do
+				for nid in "${!CAPTURED[@]}"; do
+					local nn="${CAPTURED[$nid]}"
 					restore_stream_from_sink "$nn"
-					link_stream_to_sink "$nn" 2>/dev/null || true
+					link_stream_to_sink "$nid" 2>/dev/null || true
 				done
 				MOVED_INPUTS=()
 				MUTE_LOCAL=false
 				_tui_push_msg "Mute local → OFF"
 			else
-				# Switching ON: move all captured streams to virtual sink
 				MUTE_LOCAL=true
-				for nn in "${!CAPTURED[@]}"; do
+				for nid in "${!CAPTURED[@]}"; do
+					local nn="${CAPTURED[$nid]}"
 					move_stream_to_sink "$nn" || true
 				done
 				_tui_push_msg "Mute local → ON"
@@ -2110,16 +2202,18 @@ tui_menu_config() {
 			;;
 		m | M)
 			if [[ "$MUTE_LOCAL" == true ]]; then
-				for nn in "${!CAPTURED[@]}"; do
+				for nid in "${!CAPTURED[@]}"; do
+					local nn="${CAPTURED[$nid]}"
 					restore_stream_from_sink "$nn"
-					link_stream_to_sink "$nn" 2>/dev/null || true
+					link_stream_to_sink "$nid" 2>/dev/null || true
 				done
 				MOVED_INPUTS=()
 				MUTE_LOCAL=false
 				_tui_push_msg "Mute local → OFF"
 			else
 				MUTE_LOCAL=true
-				for nn in "${!CAPTURED[@]}"; do
+				for nid in "${!CAPTURED[@]}"; do
+					local nn="${CAPTURED[$nid]}"
 					move_stream_to_sink "$nn" || true
 				done
 				_tui_push_msg "Mute local → ON"
@@ -2253,9 +2347,9 @@ tui_menu_info() {
 
 		printf '  %bCaptured streams (%d)%b\n' "$_B" "${#CAPTURED[@]}" "$_N" >&2
 		if ((${#CAPTURED[@]} > 0)); then
-			local nn
-			for nn in "${!CAPTURED[@]}"; do
-				printf '    ● %s\n' "$nn" >&2
+			local nid
+			for nid in "${!CAPTURED[@]}"; do
+				printf '    ● %s\n' "${CAPTURED[$nid]}" >&2
 			done
 		else
 			printf '    %b(none)%b\n' "$_D" "$_N" >&2
