@@ -41,6 +41,7 @@ RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/pipewire-audio-share"
 declare -A CAPTURED=()      # node_name → "1"  (streams we are managing)
 declare -A SKIPPED=()       # node_name → "1"  (streams we skipped, e.g. peer-owned)
 declare -A MOVED_INPUTS=()  # pactl_index → original_sink  (for mute-local restore)
+declare -A OUR_LINKS=()     # "out_port|in_port" → 1  (links WE created via pw-link)
 declare -A MANUAL_ADD=()    # node_name → "1"  (user explicitly added via TUI)
 declare -A MANUAL_REMOVE=() # node_name → "1"  (user explicitly removed via TUI)
 declare -i SKIP_RETRY_CTR=0 # cycle counter for periodic SKIPPED re-evaluation
@@ -646,61 +647,35 @@ resolve_sink_port() {
 	return 1
 }
 
-# Remove ALL pw-links from a stream's output ports to our virtual sink.
-# Attempts every output→sink combination unconditionally (no link_exists gate)
-# to avoid races and awk-matching edge cases, then verifies removal.
+# Remove only the pw-links that WE created (tracked in OUR_LINKS) from a
+# stream's output ports to our virtual sink.  Links that WirePlumber or other
+# software created (e.g. routing to our sink because it is the default) are
+# left intact so local playback is not disrupted.
 # Sets _UNLINK_COUNT to the number of links actually removed.
 _UNLINK_COUNT=0
 unlink_stream_from_sink() {
 	local node_name="$1"
 	_UNLINK_COUNT=0
 
-	local out_ports
-	out_ports=$(pw-link -o 2>/dev/null | grep "^${node_name}:output_" || true)
-	[[ -z "$out_ports" ]] && return 0
+	local key out_port in_port link_err
+	for key in "${!OUR_LINKS[@]}"; do
+		out_port="${key%%|*}"
+		in_port="${key#*|}"
 
-	# Collect all of our sink's input ports once
-	local sink_ports
-	sink_ports=$(pw-link -i 2>/dev/null | grep "^${SINK_NAME}:playback_" || true)
-	[[ -z "$sink_ports" ]] && return 0
+		# Only process links belonging to the requested stream
+		[[ "$out_port" == "${node_name}:output_"* ]] || continue
 
-	# Try to disconnect every output×input combination — pw-link -d is a
-	# no-op (exits non-zero) when the link doesn't exist, so this is safe.
-	local out_port in_port link_err
-	while IFS= read -r out_port; do
-		while IFS= read -r in_port; do
-			if link_err=$(pw-link -d "$out_port" "$in_port" 2>&1); then
-				log "  Unlinked ${out_port} → ${in_port}"
-				((_UNLINK_COUNT++)) || true
-			else
-				# Silence "No such file or directory" (link didn't exist) but
-				# report any other error.
-				if [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
-					warn "  Failed to unlink ${out_port} → ${in_port}: ${link_err}"
-				fi
+		if link_err=$(pw-link -d "$out_port" "$in_port" 2>&1); then
+			log "  Unlinked ${out_port} → ${in_port}"
+			((_UNLINK_COUNT++)) || true
+		else
+			# Link may already be gone (stream closed, etc.) — not an error.
+			if [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
+				warn "  Failed to unlink ${out_port} → ${in_port}: ${link_err}"
 			fi
-		done <<<"$sink_ports"
-	done <<<"$out_ports"
-
-	# Verify: if any links from this stream to our sink still remain, warn.
-	local remaining
-	remaining=$(pw-link -l 2>/dev/null | awk -v node="$node_name" -v sink="$SINK_NAME" '
-		$0 ~ "^"node":output_" { port=$0; next }
-		port && /\|->/ {
-			gsub(/^\s+\|-> /,"")
-			if (index($0, sink":playback_") == 1) print port " → " $0
-			next
-		}
-		!/^\s/ { port="" }
-	')
-	if [[ -n "$remaining" ]]; then
-		warn "  Links still present after unlink!"
-		while IFS= read -r line; do
-			warn "    ${line}"
-		done <<<"$remaining"
-		return 1
-	fi
-	return 0
+		fi
+		unset "OUR_LINKS[$key]"
+	done
 }
 
 # Create additional pw-links from a stream's output ports to our sink.
@@ -733,6 +708,7 @@ link_stream_to_sink() {
 		local link_err
 		if link_err=$(pw-link -- "$out_port" "$in_port" 2>&1); then
 			log "  Linked ${out_port} → ${in_port}"
+			OUR_LINKS["${out_port}|${in_port}"]=1
 			linked=true
 		else
 			# May already exist (race) — treat "File exists" as success
