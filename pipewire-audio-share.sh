@@ -30,6 +30,7 @@ POLL_INTERVAL=2
 VERBOSE=false
 INTERACTIVE=false
 CREATE_SOURCE=false
+SET_DEFAULT_SOURCE=false
 SOURCE_NAME=""
 SOURCE_DESCRIPTION=""
 declare -a INCLUDE=()
@@ -39,7 +40,8 @@ declare -a EXCLUDE=()
 
 MODULE_ID=""
 SOURCE_MODULE_ID=""
-STARTUP_DEFAULT_SINK="" # captured once; used only as a last resort
+ORIGINAL_DEFAULT_SOURCE="" # saved when --default-source is used; restored on exit
+STARTUP_DEFAULT_SINK=""    # captured once; used only as a last resort
 CLEANUP_DONE=false
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/pipewire-audio-share"
 declare -A CAPTURED=()      # node_name → "1"  (streams we are managing)
@@ -148,6 +150,9 @@ usage() {
 		"    Name for the virtual source (default: <sink-name>_input)" \
 		"--source-description DESC" \
 		"    Description for the virtual source" \
+		"--default-source" \
+		"    Set the virtual source as the system default input" \
+		"    device so apps like Audacity see it (restored on exit)" \
 		"-p, --poll-interval SECS" \
 		"    How often to scan for changes (default: 2)" \
 		"-i, --interactive" \
@@ -226,7 +231,10 @@ usage() {
 		"" \
 		"# create a virtual microphone from the shared audio" \
 		"pipewire-audio-share.sh --source" \
-		"pipewire-audio-share.sh -S --source-name my_mic -I firefox"
+		"pipewire-audio-share.sh -S --source-name my_mic -I firefox" \
+		"" \
+		"# virtual mic as default input (for apps that only see 'default')" \
+		"pipewire-audio-share.sh -S --default-source"
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -289,6 +297,11 @@ parse_args() {
 		--source-description)
 			SOURCE_DESCRIPTION="$2"
 			shift 2
+			;;
+		--default-source)
+			SET_DEFAULT_SOURCE=true
+			CREATE_SOURCE=true
+			shift
 			;;
 		-p | --poll-interval)
 			POLL_INTERVAL="$2"
@@ -660,6 +673,16 @@ create_source() {
 
 	# Update PID file with the source node ID
 	write_pid_file
+
+	# Optionally make this source the system default input device
+	if [[ "$SET_DEFAULT_SOURCE" == true ]]; then
+		ORIGINAL_DEFAULT_SOURCE=$(pactl get-default-source 2>/dev/null || true)
+		if pactl set-default-source "$SOURCE_NAME" 2>/dev/null; then
+			log "  Set as default input device (was: ${ORIGINAL_DEFAULT_SOURCE:-?})"
+		else
+			warn "  Failed to set default source"
+		fi
+	fi
 }
 
 remove_source() {
@@ -1168,6 +1191,12 @@ cleanup() {
 			pactl move-sink-input "$idx" "$live_default" 2>/dev/null &&
 				log "  Fallback-restored sink-input #${idx}" || true
 		done <<<"$leftover"
+	fi
+
+	# Restore the original default source before removing the virtual source
+	if [[ "$SET_DEFAULT_SOURCE" == true && -n "$ORIGINAL_DEFAULT_SOURCE" ]]; then
+		log "Restoring default input device → ${ORIGINAL_DEFAULT_SOURCE}"
+		pactl set-default-source "$ORIGINAL_DEFAULT_SOURCE" 2>/dev/null || true
 	fi
 
 	remove_source
@@ -1868,6 +1897,13 @@ tui_menu_config() {
 			printf '%bOFF%b\n' "$_R" "$_N" >&2
 		fi
 
+		printf '  %b[d]%b Default source: ' "$_Y" "$_N" >&2
+		if [[ "$SET_DEFAULT_SOURCE" == true ]]; then
+			printf '%bON%b\n' "$_G" "$_N" >&2
+		else
+			printf '%bOFF%b\n' "$_R" "$_N" >&2
+		fi
+
 		printf '\n' >&2
 		if ((${#INCLUDE[@]} > 0)); then
 			printf '  Include: %s\n' "${INCLUDE[*]}" >&2
@@ -1930,6 +1966,10 @@ tui_menu_config() {
 			;;
 		s | S)
 			if [[ "$CREATE_SOURCE" == true ]]; then
+				if [[ "$SET_DEFAULT_SOURCE" == true && -n "$ORIGINAL_DEFAULT_SOURCE" ]]; then
+					pactl set-default-source "$ORIGINAL_DEFAULT_SOURCE" 2>/dev/null || true
+					SET_DEFAULT_SOURCE=false
+				fi
 				remove_source
 				CREATE_SOURCE=false
 				write_pid_file
@@ -1943,6 +1983,25 @@ tui_menu_config() {
 				else
 					CREATE_SOURCE=false
 					_tui_push_msg "Failed to create source device"
+				fi
+			fi
+			;;
+		d | D)
+			if [[ "$CREATE_SOURCE" != true || -z "$SOURCE_MODULE_ID" ]]; then
+				_tui_push_msg "Enable source device first (s)"
+			elif [[ "$SET_DEFAULT_SOURCE" == true ]]; then
+				if [[ -n "$ORIGINAL_DEFAULT_SOURCE" ]]; then
+					pactl set-default-source "$ORIGINAL_DEFAULT_SOURCE" 2>/dev/null || true
+				fi
+				SET_DEFAULT_SOURCE=false
+				_tui_push_msg "Default source → OFF (restored previous)"
+			else
+				ORIGINAL_DEFAULT_SOURCE=$(pactl get-default-source 2>/dev/null || true)
+				if pactl set-default-source "$SOURCE_NAME" 2>/dev/null; then
+					SET_DEFAULT_SOURCE=true
+					_tui_push_msg "Default source → ON"
+				else
+					_tui_push_msg "Failed to set default source"
 				fi
 			fi
 			;;
@@ -2015,7 +2074,11 @@ tui_menu_info() {
 		if [[ "$CREATE_SOURCE" == true && -n "$SOURCE_MODULE_ID" ]]; then
 			printf '    Name:         %s\n' "$SOURCE_NAME" >&2
 			printf '    Description:  %s\n' "$SOURCE_DESCRIPTION" >&2
-			printf '    Module ID:    %s\n' "$SOURCE_MODULE_ID" >&2
+			printf '    Node ID:      %s\n' "$SOURCE_MODULE_ID" >&2
+			printf '    Default:      %s\n' "$SET_DEFAULT_SOURCE" >&2
+			if [[ "$SET_DEFAULT_SOURCE" == true ]]; then
+				printf '    Previous:     %s\n' "${ORIGINAL_DEFAULT_SOURCE:-(none)}" >&2
+			fi
 		else
 			printf '    %b(disabled — use -S or toggle in Config)%b\n' "$_D" "$_N" >&2
 		fi
@@ -2180,6 +2243,9 @@ main() {
 	log "Auto-capture:  ${AUTO_CAPTURE}"
 	log "Mute local:    ${MUTE_LOCAL}"
 	log "Source device:  ${CREATE_SOURCE}"
+	if [[ "$SET_DEFAULT_SOURCE" == true ]]; then
+		log "Default source: yes"
+	fi
 	if ((${#INCLUDE[@]} > 0)); then
 		log "Include:     ${INCLUDE[*]}"
 	elif ((${#EXCLUDE[@]} > 0)); then

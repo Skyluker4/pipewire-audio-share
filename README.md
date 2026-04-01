@@ -93,6 +93,9 @@ Bash script.
 
 # Also create a virtual microphone from the shared audio
 ./pipewire-audio-share.sh --source
+
+# Virtual mic as default input (for apps that only see "default")
+./pipewire-audio-share.sh -S --default-source
 ```
 
 Press **Ctrl+C** to stop. The virtual sink is removed and all streams are
@@ -112,22 +115,23 @@ pipewire-audio-share.sh --stop-all
 
 ### Options
 
-| Flag                         | Description                                          | Default        |
-| ---------------------------- | ---------------------------------------------------- | -------------- |
-| `-n`, `--sink-name NAME`     | PipeWire sink name                                   | `audio_share`  |
-| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc. | `Audio Share`  |
-| `-a`, `--auto-capture`       | Capture new streams as they appear                   | **on**         |
-| `-A`, `--no-auto-capture`    | Only capture streams present at startup              |                |
-| `-I`, `--include APP`        | Application pattern to capture (repeatable)          |                |
-| `-X`, `--exclude APP`        | Application pattern to exclude (repeatable)          |                |
-| `-m`, `--mute-local`         | Don't play captured audio on the default output      | off            |
-| `-S`, `--source`             | Also create a virtual input device (source/mic)      | off            |
-| `--source-name NAME`         | Name for the virtual source                          | `<sink>_input` |
-| `--source-description DESC`  | Description for the virtual source                   |                |
-| `-p`, `--poll-interval SECS` | How often to scan for changes                        | `2`            |
-| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)         |                |
-| `-v`, `--verbose`            | Print debug-level log output                         |                |
-| `-h`, `--help`               | Show built-in help text                              |                |
+| Flag                         | Description                                               | Default        |
+| ---------------------------- | --------------------------------------------------------- | -------------- |
+| `-n`, `--sink-name NAME`     | PipeWire sink name                                        | `audio_share`  |
+| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc.      | `Audio Share`  |
+| `-a`, `--auto-capture`       | Capture new streams as they appear                        | **on**         |
+| `-A`, `--no-auto-capture`    | Only capture streams present at startup                   |                |
+| `-I`, `--include APP`        | Application pattern to capture (repeatable)               |                |
+| `-X`, `--exclude APP`        | Application pattern to exclude (repeatable)               |                |
+| `-m`, `--mute-local`         | Don't play captured audio on the default output           | off            |
+| `-S`, `--source`             | Also create a virtual input device (source/mic)           | off            |
+| `--source-name NAME`         | Name for the virtual source                               | `<sink>_input` |
+| `--source-description DESC`  | Description for the virtual source                        |                |
+| `--default-source`           | Set virtual source as system default input (implies `-S`) | off            |
+| `-p`, `--poll-interval SECS` | How often to scan for changes                             | `2`            |
+| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)              |                |
+| `-v`, `--verbose`            | Print debug-level log output                              |                |
+| `-h`, `--help`               | Show built-in help text                                   |                |
 
 ### Management commands
 
@@ -217,6 +221,7 @@ Volume bars are colour-coded: green ≤60%, yellow 61–85%, red >85%.
 | **m**       | Toggle mute-local                                   |
 | **p**       | Change poll interval (prompts for input)            |
 | **s**       | Toggle virtual source device on/off                 |
+| **d**       | Toggle virtual source as default input device       |
 | **w**       | Edit include (prompts for comma-separated patterns) |
 | **e**       | Edit exclude (prompts for comma-separated patterns) |
 | **b / Esc** | Back                                                |
@@ -292,8 +297,11 @@ instance's sink.
 4. If **`--source`** is given, a native PipeWire **`Audio/Source/Virtual`**
    node is created and linked to the sink's monitor, exposing it as a
    regular input device with the `HARDWARE` flag. This makes it visible
-   to all applications (Audacity, Discord, Zoom, OBS, etc.) as a
-   selectable microphone.
+   to most applications (Discord, Zoom, OBS, etc.) as a selectable
+   microphone. If **`--default-source`** is also given, it is set as the
+   system default input device (restored on exit), which makes it
+   available to applications like Audacity that only enumerate the
+   default device.
 
 5. A **polling loop** (configurable interval, default 2s) continuously:
    - Discovers new streams and captures them (if auto-capture is on)
@@ -413,6 +421,21 @@ PID file and unloads the orphaned module:
 WARN: Found stale PID file for 'audio_share' (PID 12345 is dead)
 Unloading orphaned module 536870916 from previous crash
 ```
+
+### Virtual source not visible in Audacity
+
+Audacity enumerates only a subset of PipeWire sources. It typically shows
+a single "pipewire" or "default" device. To use the virtual source in
+Audacity, add `--default-source`:
+
+```sh
+pipewire-audio-share.sh -S --default-source
+```
+
+This sets the virtual source as the system default input device (restored
+on exit). In Audacity, select the **pipewire** or **default** source and
+it will receive the shared audio. Alternatively, set the default source
+manually in pavucontrol's _Input Devices_ tab.
 
 If the PID file was also lost, the script detects the existing sink by
 name and unloads just that specific module (not all null sinks).
