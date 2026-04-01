@@ -35,6 +35,7 @@ SOURCE_NAME=""
 SOURCE_DESCRIPTION=""
 declare -a INCLUDE=()
 declare -a EXCLUDE=()
+declare -a ROUTE_INPUTS=()
 
 # ─── runtime state ───────────────────────────────────────────────────────────
 
@@ -44,16 +45,17 @@ ORIGINAL_DEFAULT_SOURCE="" # saved when --default-source is used; restored on ex
 STARTUP_DEFAULT_SINK=""    # captured once; used only as a last resort
 CLEANUP_DONE=false
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/pipewire-audio-share"
-declare -A CAPTURED=()      # node_name → "1"  (streams we are managing)
-declare -A SKIPPED=()       # node_name → "1"  (streams we skipped, e.g. peer-owned)
-declare -A MOVED_INPUTS=()  # pactl_index → original_sink  (for mute-local restore)
-declare -A OUR_LINKS=()     # "out_port|in_port" → 1  (links WE created via pw-link)
-declare -A MANUAL_ADD=()    # node_name → "1"  (user explicitly added via TUI)
-declare -A MANUAL_REMOVE=() # node_name → "1"  (user explicitly removed via TUI)
-declare -i SKIP_RETRY_CTR=0 # cycle counter for periodic SKIPPED re-evaluation
-SKIP_RETRY_EVERY=15         # retry skipped streams every N poll cycles (~30s at 2s poll)
-TUI_ACTIVE=false            # true while the interactive TUI owns the screen
-declare -a TUI_MESSAGES=()  # ring buffer of recent warnings/errors for TUI
+declare -A CAPTURED=()        # node_name → "1"  (streams we are managing)
+declare -A SKIPPED=()         # node_name → "1"  (streams we skipped, e.g. peer-owned)
+declare -A MOVED_INPUTS=()    # pactl_index → original_sink  (for mute-local restore)
+declare -A OUR_LINKS=()       # "out_port|in_port" → 1  (links WE created via pw-link)
+declare -A CAPTURED_INPUTS=() # node_name → "1"  (input devices routed to our sink)
+declare -A MANUAL_ADD=()      # node_name → "1"  (user explicitly added via TUI)
+declare -A MANUAL_REMOVE=()   # node_name → "1"  (user explicitly removed via TUI)
+declare -i SKIP_RETRY_CTR=0   # cycle counter for periodic SKIPPED re-evaluation
+SKIP_RETRY_EVERY=15           # retry skipped streams every N poll cycles (~30s at 2s poll)
+TUI_ACTIVE=false              # true while the interactive TUI owns the screen
+declare -a TUI_MESSAGES=()    # ring buffer of recent warnings/errors for TUI
 
 # ─── colours / logging ──────────────────────────────────────────────────────
 
@@ -143,6 +145,9 @@ usage() {
 		"-m, --mute-local" \
 		"    Do NOT play captured audio on the default output" \
 		"    (moves streams exclusively to the virtual sink)" \
+		"-R, --route-input DEVICE" \
+		"    Route an input device (mic, line-in) to the sink" \
+		"    (repeatable; pattern-matched like -I/-X)" \
 		"-S, --source" \
 		"    Also create a virtual input device (source) from the" \
 		"    sink's monitor so apps can use it as a microphone" \
@@ -234,7 +239,11 @@ usage() {
 		"pipewire-audio-share.sh -S --source-name my_mic -I firefox" \
 		"" \
 		"# virtual mic as default input (for apps that only see 'default')" \
-		"pipewire-audio-share.sh -S --default-source"
+		"pipewire-audio-share.sh -S --default-source" \
+		"" \
+		"# route a microphone into the shared audio" \
+		"pipewire-audio-share.sh -R headset" \
+		"pipewire-audio-share.sh -R webcam -R line-in"
 }
 
 # ─── argument parsing ────────────────────────────────────────────────────────
@@ -285,6 +294,10 @@ parse_args() {
 		-m | --mute-local)
 			MUTE_LOCAL=true
 			shift
+			;;
+		-R | --route-input)
+			ROUTE_INPUTS+=("$2")
+			shift 2
 			;;
 		-S | --source)
 			CREATE_SOURCE=true
@@ -691,6 +704,130 @@ remove_source() {
 		pw-cli destroy "$SOURCE_MODULE_ID" 2>/dev/null || true
 		SOURCE_MODULE_ID=""
 	fi
+}
+
+# ─── input device routing ───────────────────────────────────────────────────
+
+# List available Audio/Source devices (hardware mics, line-ins, etc.).
+# Emits one JSON object per device: { "node_name": "…", "description": "…" }
+get_input_devices() {
+	pw-dump 2>/dev/null | jq -c '
+		[ .[]
+			| select(.info.props."media.class" == "Audio/Source")
+			| {
+				node_name: .info.props."node.name",
+				description: (.info.props."node.description" // "")
+			}
+		] | .[]
+	' 2>/dev/null
+}
+
+# Check whether an input device matches any --route-input pattern.
+input_matches_route() {
+	local node_name="$1" description="$2"
+	((${#ROUTE_INPUTS[@]} == 0)) && return 1
+	local haystack="${node_name,,} ${description,,}"
+	local pat
+	for pat in "${ROUTE_INPUTS[@]}"; do
+		pat="${pat,,}"
+		pat="${pat#"${pat%%[![:space:]]*}"}"
+		pat="${pat%"${pat##*[![:space:]]}"}"
+		[[ "$haystack" == *"$pat"* ]] && return 0
+	done
+	return 1
+}
+
+# Link an input device's capture ports to our virtual sink.
+link_input_to_sink() {
+	local node_name="$1"
+	local linked=false
+
+	local cap_ports
+	cap_ports=$(pw-link -o 2>/dev/null | grep "^${node_name}:capture_" || true)
+	[[ -z "$cap_ports" ]] && {
+		debug "No capture ports for ${node_name}"
+		return 1
+	}
+
+	local cap_port
+	while IFS= read -r cap_port; do
+		local channel="${cap_port##*capture_}"
+
+		if [[ "$channel" == "MONO" ]]; then
+			# Mono input → link to both FL and FR
+			local in_port
+			for in_port in "${SINK_NAME}:playback_FL" "${SINK_NAME}:playback_FR"; do
+				local link_err
+				if link_err=$(pw-link -- "$cap_port" "$in_port" 2>&1); then
+					log "  Linked ${cap_port} → ${in_port}"
+					OUR_LINKS["${cap_port}|${in_port}"]=1
+					linked=true
+				elif [[ "$link_err" == *"File exists"* ]]; then
+					linked=true
+				else
+					warn "  Failed to link ${cap_port} → ${in_port}: ${link_err}"
+				fi
+			done
+		else
+			# Stereo channel → match FL→FL, FR→FR
+			local in_port="${SINK_NAME}:playback_${channel}"
+			if ! pw-link -i 2>/dev/null | grep -qxF "$in_port"; then
+				in_port="${SINK_NAME}:playback_FL"
+			fi
+			local link_err
+			if link_err=$(pw-link -- "$cap_port" "$in_port" 2>&1); then
+				log "  Linked ${cap_port} → ${in_port}"
+				OUR_LINKS["${cap_port}|${in_port}"]=1
+				linked=true
+			elif [[ "$link_err" == *"File exists"* ]]; then
+				linked=true
+			else
+				warn "  Failed to link ${cap_port} → ${in_port}: ${link_err}"
+			fi
+		fi
+	done <<<"$cap_ports"
+
+	$linked
+}
+
+# Remove links WE created from an input device to our sink.
+unlink_input_from_sink() {
+	local node_name="$1"
+	local key out_port in_port link_err
+	local count=0
+	for key in "${!OUR_LINKS[@]}"; do
+		out_port="${key%%|*}"
+		in_port="${key#*|}"
+		[[ "$out_port" == "${node_name}:capture_"* ]] || continue
+		if link_err=$(pw-link -d "$out_port" "$in_port" 2>&1); then
+			log "  Unlinked ${out_port} → ${in_port}"
+			((++count)) || true
+		fi
+		unset "OUR_LINKS[$key]"
+	done
+	debug "Removed ${count} input link(s) for ${node_name}"
+}
+
+# Route matching input devices to the sink (called at startup).
+route_input_devices() {
+	((${#ROUTE_INPUTS[@]} > 0)) || return 0
+	log "Routing input devices …"
+	local count=0
+	while IFS= read -r obj; do
+		[[ -z "$obj" ]] && continue
+		local nn desc
+		nn=$(jq -r '.node_name // empty' <<<"$obj")
+		desc=$(jq -r '.description // empty' <<<"$obj")
+		[[ -z "$nn" ]] && continue
+		if input_matches_route "$nn" "$desc"; then
+			log "Routing input: ${_B}${desc:-$nn}${_N}  (${nn})"
+			if link_input_to_sink "$nn"; then
+				CAPTURED_INPUTS["$nn"]=1
+				((++count))
+			fi
+		fi
+	done < <(get_input_devices)
+	log "Routed ${_B}${count}${_N} input device(s)"
 }
 
 # ─── stream discovery ───────────────────────────────────────────────────────
@@ -1150,6 +1287,21 @@ verify_existing_links() {
 	if ((SKIP_RETRY_CTR >= SKIP_RETRY_EVERY)); then
 		SKIP_RETRY_CTR=0
 	fi
+
+	# Verify routed input device links
+	local stale_inputs=()
+	for node_name in "${!CAPTURED_INPUTS[@]}"; do
+		if ! pw-link -o 2>/dev/null | grep -q "^${node_name}:capture_"; then
+			debug "Input device gone: ${node_name}"
+			stale_inputs+=("$node_name")
+			continue
+		fi
+		# Re-create links if broken
+		link_input_to_sink "$node_name" 2>/dev/null || true
+	done
+	for node_name in "${stale_inputs[@]}"; do
+		unset "CAPTURED_INPUTS[$node_name]"
+	done
 }
 
 # ─── cleanup ─────────────────────────────────────────────────────────────────
@@ -1197,6 +1349,15 @@ cleanup() {
 	if [[ "$SET_DEFAULT_SOURCE" == true && -n "$ORIGINAL_DEFAULT_SOURCE" ]]; then
 		log "Restoring default input device → ${ORIGINAL_DEFAULT_SOURCE}"
 		pactl set-default-source "$ORIGINAL_DEFAULT_SOURCE" 2>/dev/null || true
+	fi
+
+	# Release routed input devices
+	if ((${#CAPTURED_INPUTS[@]} > 0)); then
+		log "Unrouting input devices …"
+		for node_name in "${!CAPTURED_INPUTS[@]}"; do
+			unlink_input_from_sink "$node_name"
+		done
+		CAPTURED_INPUTS=()
 	fi
 
 	remove_source
@@ -2101,6 +2262,17 @@ tui_menu_info() {
 		fi
 		printf '\n' >&2
 
+		printf '  %bRouted inputs (%d)%b\n' "$_B" "${#CAPTURED_INPUTS[@]}" "$_N" >&2
+		if ((${#CAPTURED_INPUTS[@]} > 0)); then
+			local nn
+			for nn in "${!CAPTURED_INPUTS[@]}"; do
+				printf '    ● %s\n' "$nn" >&2
+			done
+		else
+			printf '    %b(none)%b\n' "$_D" "$_N" >&2
+		fi
+		printf '\n' >&2
+
 		# Show other instances
 		printf '  %bInstances%b\n' "$_B" "$_N" >&2
 		local f found_any=false
@@ -2139,6 +2311,160 @@ tui_menu_info() {
 	done
 }
 
+# ── TUI menu: Inputs ──
+
+declare -a _TUI_INPUTS=()
+_TUI_INPUT_COUNT=0
+
+tui_refresh_inputs() {
+	_TUI_INPUTS=()
+	_TUI_INPUT_COUNT=0
+	while IFS= read -r obj; do
+		[[ -z "$obj" ]] && continue
+		local nn desc
+		nn=$(jq -r '.node_name // empty' <<<"$obj")
+		desc=$(jq -r '.description // empty' <<<"$obj")
+		[[ -z "$nn" ]] && continue
+		# Skip our own virtual source
+		[[ -n "$SOURCE_NAME" && "$nn" == "$SOURCE_NAME" ]] && continue
+
+		local st="available"
+		[[ -v "CAPTURED_INPUTS[$nn]" ]] && st="routed"
+
+		_TUI_INPUTS+=("${nn}	${desc}	${st}")
+		((++_TUI_INPUT_COUNT))
+	done < <(get_input_devices)
+}
+
+tui_menu_inputs() {
+	local sel=0
+	while true; do
+		tui_refresh_inputs
+		tui_clear
+		tui_header "Inputs"
+		printf '\n' >&2
+
+		if ((_TUI_INPUT_COUNT == 0)); then
+			printf '  %b(no input devices found)%b\n' "$_D" "$_N" >&2
+		else
+			local i
+			for ((i = 0; i < _TUI_INPUT_COUNT; i++)); do
+				local rec="${_TUI_INPUTS[$i]}"
+				local nn desc st
+				IFS=$'\t' read -r nn desc st <<<"$rec"
+				local label="${desc:-$nn}"
+
+				local marker color
+				case "$st" in
+				routed)
+					marker="●"
+					color="$_G"
+					;;
+				*)
+					marker="○"
+					color="$_N"
+					;;
+				esac
+
+				local ptr="  "
+				((i == sel)) && ptr="▸ "
+
+				printf '  %s%b%s %d. %s%b\n' \
+					"$ptr" "$color" "$marker" $((i + 1)) "$label" "$_N" >&2
+			done
+		fi
+
+		printf '\n' >&2
+		tui_rule
+		tui_hint "↑↓" "navigate"
+		tui_hint "Space" "toggle"
+		tui_hint "a" "route all"
+		tui_hint "n" "unroute all"
+		printf '\n' >&2
+		tui_hint "b/Esc" "back"
+		printf '\n' >&2
+		tui_show_messages
+
+		local key
+		key=$(tui_read_key "$POLL_INTERVAL") || {
+			[[ "$AUTO_CAPTURE" == true ]] && scan_new_streams
+			verify_existing_links
+			continue
+		}
+
+		case "$key" in
+		UP)
+			((sel > 0)) && ((sel--))
+			;;
+		DOWN)
+			((sel < _TUI_INPUT_COUNT - 1)) && ((sel++)) || true
+			;;
+		' ' | ENTER)
+			((_TUI_INPUT_COUNT > 0)) || continue
+			local rec="${_TUI_INPUTS[$sel]}"
+			local nn desc st
+			IFS=$'\t' read -r nn desc st <<<"$rec"
+			if [[ "$st" == "routed" ]]; then
+				unlink_input_from_sink "$nn"
+				unset "CAPTURED_INPUTS[$nn]"
+				_tui_push_msg "Unrouted: ${desc:-$nn}"
+			else
+				if link_input_to_sink "$nn"; then
+					CAPTURED_INPUTS["$nn"]=1
+					_tui_push_msg "Routed: ${desc:-$nn}"
+				else
+					_tui_push_msg "Failed to route: ${desc:-$nn}"
+				fi
+			fi
+			;;
+		[1-9])
+			local idx=$((key - 1))
+			if ((idx < _TUI_INPUT_COUNT)); then
+				sel=$idx
+				local rec="${_TUI_INPUTS[$sel]}"
+				local nn desc st
+				IFS=$'\t' read -r nn desc st <<<"$rec"
+				if [[ "$st" == "routed" ]]; then
+					unlink_input_from_sink "$nn"
+					unset "CAPTURED_INPUTS[$nn]"
+					_tui_push_msg "Unrouted: ${desc:-$nn}"
+				else
+					if link_input_to_sink "$nn"; then
+						CAPTURED_INPUTS["$nn"]=1
+						_tui_push_msg "Routed: ${desc:-$nn}"
+					else
+						_tui_push_msg "Failed to route: ${desc:-$nn}"
+					fi
+				fi
+			fi
+			;;
+		a | A)
+			tui_refresh_inputs
+			local i
+			for ((i = 0; i < _TUI_INPUT_COUNT; i++)); do
+				local rec="${_TUI_INPUTS[$i]}"
+				local nn desc st
+				IFS=$'\t' read -r nn desc st <<<"$rec"
+				if [[ "$st" != "routed" ]]; then
+					link_input_to_sink "$nn" && CAPTURED_INPUTS["$nn"]=1 || true
+				fi
+			done
+			_tui_push_msg "Routed all input devices"
+			;;
+		n | N)
+			for nn in "${!CAPTURED_INPUTS[@]}"; do
+				unlink_input_from_sink "$nn"
+			done
+			CAPTURED_INPUTS=()
+			_tui_push_msg "Unrouted all input devices"
+			;;
+		b | B | ESC | q | Q)
+			return
+			;;
+		esac
+	done
+}
+
 # ── TUI main menu ──
 
 tui_menu_main() {
@@ -2159,6 +2485,9 @@ tui_menu_main() {
 		printf '\n' >&2
 
 		printf '  Streams: %b%d%b captured' "$_B" "${#CAPTURED[@]}" "$_N" >&2
+		if ((${#CAPTURED_INPUTS[@]} > 0)); then
+			printf ', %b%d%b input(s) routed' "$_B" "${#CAPTURED_INPUTS[@]}" "$_N" >&2
+		fi
 		local ml_tag=""
 		[[ "$MUTE_LOCAL" == true ]] && ml_tag="  ${_R}(mute-local)${_N}"
 		printf '%b\n' "$ml_tag" >&2
@@ -2172,10 +2501,12 @@ tui_menu_main() {
 		tui_hint "s" "Streams"
 		tui_hint "v" "Volume"
 		printf '\n' >&2
+		tui_hint "r" "Route inputs"
 		tui_hint "o" "Output"
-		tui_hint "c" "Config"
 		printf '\n' >&2
+		tui_hint "c" "Config"
 		tui_hint "i" "Info"
+		printf '\n' >&2
 		tui_hint "q" "Quit"
 		printf '\n' >&2
 		tui_show_messages
@@ -2190,6 +2521,7 @@ tui_menu_main() {
 		case "$key" in
 		s | S) tui_menu_streams ;;
 		v | V) tui_menu_volume ;;
+		r | R) tui_menu_inputs ;;
 		o | O) tui_menu_output ;;
 		c | C) tui_menu_config ;;
 		i | I) tui_menu_info ;;
@@ -2246,6 +2578,9 @@ main() {
 	if [[ "$SET_DEFAULT_SOURCE" == true ]]; then
 		log "Default source: yes"
 	fi
+	if ((${#ROUTE_INPUTS[@]} > 0)); then
+		log "Route inputs:  ${ROUTE_INPUTS[*]}"
+	fi
 	if ((${#INCLUDE[@]} > 0)); then
 		log "Include:     ${INCLUDE[*]}"
 	elif ((${#EXCLUDE[@]} > 0)); then
@@ -2273,6 +2608,7 @@ main() {
 	create_sink
 	create_source
 	capture_existing_streams
+	route_input_devices
 
 	log "───────────────────────────────────────"
 	log "Virtual sink ${_B}${SINK_NAME}${_N} is ready."

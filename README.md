@@ -15,19 +15,20 @@ playback with `--mute-local`.
 
 ## Features
 
-| Feature                 | Description                                                                                   |
-| ----------------------- | --------------------------------------------------------------------------------------------- |
-| **Virtual null sink**   | Creates a dedicated PipeWire sink with monitor ports that capture software can read           |
-| **Virtual source**      | Optionally exposes the sink as a regular input device (microphone) for apps like Discord      |
-| **Auto-capture**        | Automatically routes every new audio stream into the sink (on by default)                     |
-| **Include / Exclude**   | Case-insensitive substring matching against application and node names                        |
-| **Mute local**          | Optionally silence captured streams on your speakers — restored on exit                       |
-| **Multiple instances**  | Run several sinks simultaneously with independent filters and options                         |
-| **Instance management** | `--status`, `--stop`, `--stop-all` for controlling background instances                       |
-| **Stale recovery**      | Crashed instances leave no orphaned sinks — automatically cleaned up                          |
-| **Interactive TUI**     | Full terminal UI for live stream toggling, volume control, output routing, and config editing |
-| **Default-sink aware**  | Tracks the _current_ default sink dynamically, not just the one at startup                    |
-| **Peer-aware muting**   | Multiple `--mute-local` instances won't fight over the same stream                            |
+| Feature                  | Description                                                                                   |
+| ------------------------ | --------------------------------------------------------------------------------------------- |
+| **Virtual null sink**    | Creates a dedicated PipeWire sink with monitor ports that capture software can read           |
+| **Virtual source**       | Optionally exposes the sink as a regular input device (microphone) for apps like Discord      |
+| **Input device routing** | Route hardware microphones and line-ins into the shared sink alongside application audio      |
+| **Auto-capture**         | Automatically routes every new audio stream into the sink (on by default)                     |
+| **Include / Exclude**    | Case-insensitive substring matching against application and node names                        |
+| **Mute local**           | Optionally silence captured streams on your speakers — restored on exit                       |
+| **Multiple instances**   | Run several sinks simultaneously with independent filters and options                         |
+| **Instance management**  | `--status`, `--stop`, `--stop-all` for controlling background instances                       |
+| **Stale recovery**       | Crashed instances leave no orphaned sinks — automatically cleaned up                          |
+| **Interactive TUI**      | Full terminal UI for live stream toggling, volume control, output routing, and config editing |
+| **Default-sink aware**   | Tracks the _current_ default sink dynamically, not just the one at startup                    |
+| **Peer-aware muting**    | Multiple `--mute-local` instances won't fight over the same stream                            |
 
 ---
 
@@ -96,6 +97,12 @@ Bash script.
 
 # Virtual mic as default input (for apps that only see "default")
 ./pipewire-audio-share.sh -S --default-source
+
+# Route a microphone into the shared audio mix
+./pipewire-audio-share.sh -R headset
+
+# Route multiple input devices
+./pipewire-audio-share.sh -R webcam -R line-in
 ```
 
 Press **Ctrl+C** to stop. The virtual sink is removed and all streams are
@@ -115,23 +122,24 @@ pipewire-audio-share.sh --stop-all
 
 ### Options
 
-| Flag                         | Description                                               | Default        |
-| ---------------------------- | --------------------------------------------------------- | -------------- |
-| `-n`, `--sink-name NAME`     | PipeWire sink name                                        | `audio_share`  |
-| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc.      | `Audio Share`  |
-| `-a`, `--auto-capture`       | Capture new streams as they appear                        | **on**         |
-| `-A`, `--no-auto-capture`    | Only capture streams present at startup                   |                |
-| `-I`, `--include APP`        | Application pattern to capture (repeatable)               |                |
-| `-X`, `--exclude APP`        | Application pattern to exclude (repeatable)               |                |
-| `-m`, `--mute-local`         | Don't play captured audio on the default output           | off            |
-| `-S`, `--source`             | Also create a virtual input device (source/mic)           | off            |
-| `--source-name NAME`         | Name for the virtual source                               | `<sink>_input` |
-| `--source-description DESC`  | Description for the virtual source                        |                |
-| `--default-source`           | Set virtual source as system default input (implies `-S`) | off            |
-| `-p`, `--poll-interval SECS` | How often to scan for changes                             | `2`            |
-| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)              |                |
-| `-v`, `--verbose`            | Print debug-level log output                              |                |
-| `-h`, `--help`               | Show built-in help text                                   |                |
+| Flag                         | Description                                                   | Default        |
+| ---------------------------- | ------------------------------------------------------------- | -------------- |
+| `-n`, `--sink-name NAME`     | PipeWire sink name                                            | `audio_share`  |
+| `-d`, `--description DESC`   | Human-readable description shown in pavucontrol etc.          | `Audio Share`  |
+| `-a`, `--auto-capture`       | Capture new streams as they appear                            | **on**         |
+| `-A`, `--no-auto-capture`    | Only capture streams present at startup                       |                |
+| `-I`, `--include APP`        | Application pattern to capture (repeatable)                   |                |
+| `-X`, `--exclude APP`        | Application pattern to exclude (repeatable)                   |                |
+| `-m`, `--mute-local`         | Don't play captured audio on the default output               | off            |
+| `-R`, `--route-input DEVICE` | Route an input device (mic, line-in) to the sink (repeatable) |                |
+| `-S`, `--source`             | Also create a virtual input device (source/mic)               | off            |
+| `--source-name NAME`         | Name for the virtual source                                   | `<sink>_input` |
+| `--source-description DESC`  | Description for the virtual source                            |                |
+| `--default-source`           | Set virtual source as system default input (implies `-S`)     | off            |
+| `-p`, `--poll-interval SECS` | How often to scan for changes                                 | `2`            |
+| `-i`, `--interactive`        | Launch interactive TUI (requires a terminal)                  |                |
+| `-v`, `--verbose`            | Print debug-level log output                                  |                |
+| `-h`, `--help`               | Show built-in help text                                       |                |
 
 ### Management commands
 
@@ -169,11 +177,12 @@ your scrollback. Background monitoring continues while you navigate menus.
 ### Menu structure
 
 ```text
-Main ─┬─ [s] Streams ── toggle capture on individual applications
-      ├─ [v] Volume ─── adjust sink and per-stream volume, mute/unmute
-      ├─ [o] Output ─── switch default hardware sink, toggle mute-local
-      ├─ [c] Config ─── auto-capture, poll interval, include/exclude
-      ├─ [i] Info ───── sink details, captured streams, running instances
+Main ─┬─ [s] Streams ──── toggle capture on individual applications
+      ├─ [v] Volume ───── adjust sink and per-stream volume, mute/unmute
+      ├─ [r] Route inputs  toggle routing of hardware mics/line-ins
+      ├─ [o] Output ───── switch default hardware sink, toggle mute-local
+      ├─ [c] Config ───── auto-capture, poll interval, include/exclude
+      ├─ [i] Info ─────── sink details, captured streams, running instances
       └─ [q] Quit
 ```
 
@@ -191,6 +200,17 @@ Main ─┬─ [s] Streams ── toggle capture on individual applications
 Manually toggled streams override the include/exclude. A manually
 removed stream won't be re-captured by auto-capture, and a manually added
 stream ignores filters.
+
+### Route inputs menu
+
+| Key               | Action                                |
+| ----------------- | ------------------------------------- |
+| **↑ / ↓**         | Navigate the input device list        |
+| **Space / Enter** | Toggle routing on the selected device |
+| **1--9**          | Quick-toggle by number                |
+| **a**             | Route all input devices               |
+| **n**             | Unroute all input devices             |
+| **b / Esc**       | Back to main menu                     |
 
 ### Volume menu
 
@@ -274,11 +294,16 @@ instance's sink.
 └──────────────┘  │                               │                  │
                   │  WirePlumber (managed)         │  monitor_FL ─────▸ Sunshine / OBS
                   │                               │  monitor_FR ─────▸ reads these
-                  ▼                               └──────────────────┘
-           ┌──────────────┐
-           │ Default Sink │  ◂── you still hear audio here
-           │ (speakers)   │
-           └──────────────┘
+                  ▼                               │                  │
+           ┌──────────────┐                       │                  │
+           │ Default Sink │  ◂── you still hear   │                  │
+           │ (speakers)   │      audio here       │                  │
+           └──────────────┘                       │                  │
+                                                  │                  │
+┌──────────────┐     pw-link (--route-input)      │                  │
+│  Microphone  ├──────────────────────────────────▸ playback_FL/FR   │
+│  (headset)   │                                  └──────────────────┘
+└──────────────┘
 ```
 
 1. **`pactl load-module module-null-sink`** creates a virtual sink with
@@ -294,7 +319,12 @@ instance's sink.
    the virtual sink. This cooperates with WirePlumber rather than fighting
    it, so there are no re-linking loops.
 
-4. If **`--source`** is given, a native PipeWire **`Audio/Source/Virtual`**
+4. If **`--route-input`** is given, the matching input device's capture
+   ports are linked to the sink's playback ports via `pw-link`, mixing
+   mic/line-in audio into the shared sink alongside application audio.
+   Mono inputs are mapped to both stereo channels.
+
+5. If **`--source`** is given, a native PipeWire **`Audio/Source/Virtual`**
    node is created and linked to the sink's monitor, exposing it as a
    regular input device with the `HARDWARE` flag. This makes it visible
    to most applications (Discord, Zoom, OBS, etc.) as a selectable
@@ -303,14 +333,15 @@ instance's sink.
    available to applications like Audacity that only enumerate the
    default device.
 
-5. A **polling loop** (configurable interval, default 2s) continuously:
+6. A **polling loop** (configurable interval, default 2s) continuously:
    - Discovers new streams and captures them (if auto-capture is on)
    - Verifies existing links haven't been broken and re-creates them
    - Re-evaluates skipped streams in case a peer instance released them
 
-6. On **exit** (Ctrl+C, SIGTERM, SIGHUP), the cleanup handler:
+7. On **exit** (Ctrl+C, SIGTERM, SIGHUP), the cleanup handler:
    - Restores muted streams to the _current_ default sink (not the startup one)
-   - Unloads the source module (if created)
+   - Unlinks routed input devices
+   - Unloads the source node (if created)
    - Unloads the null-sink module
    - Removes the PID file
 
