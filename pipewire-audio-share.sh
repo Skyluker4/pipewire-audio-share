@@ -52,6 +52,11 @@ declare -A OUR_LINKS=()       # "out_port_id|in_port_id" → 1  (links WE create
 declare -A CAPTURED_INPUTS=() # node_name → "1"  (input devices routed to our sink)
 declare -A MANUAL_ADD=()      # node_id → "1"  (user explicitly added via TUI)
 declare -A MANUAL_REMOVE=()   # node_id → "1"  (user explicitly removed via TUI)
+declare -A PINNED_CAPTURES=() # node_name → "1"  (capture streams pinned to our monitor)
+LAST_KNOWN_DEFAULT=""         # most recent default sink that was a real output device
+DEFAULT_SHARE_BY_USER=false   # true when the user set the default to our sink via the TUI
+_GUARD_LAST_CUR=""            # default sink seen on the previous guard cycle
+_GUARD_CUR_VIRTUAL=false      # whether _GUARD_LAST_CUR is a virtual (null) sink
 declare -i SKIP_RETRY_CTR=0   # cycle counter for periodic SKIPPED re-evaluation
 SKIP_RETRY_EVERY=15           # retry skipped streams every N poll cycles (~30s at 2s poll)
 TUI_ACTIVE=false              # true while the interactive TUI owns the screen
@@ -557,6 +562,7 @@ cmd_stop_all() {
 get_default_sink() {
 	STARTUP_DEFAULT_SINK=$(pactl get-default-sink 2>/dev/null) ||
 		die "Could not determine default audio sink"
+	LAST_KNOWN_DEFAULT="$STARTUP_DEFAULT_SINK"
 	log "Default sink: ${_B}${STARTUP_DEFAULT_SINK}${_N}"
 }
 
@@ -570,6 +576,153 @@ sink_exists() {
 	pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF "$SINK_NAME"
 }
 
+# Is the given sink a virtual (null) sink with no hardware backing?
+# Virtual sinks (ours, Sunshine's "sink-sunshine-*", etc.) produce no local
+# audio, so a default pointing at one is almost always a hijack, not a
+# deliberate choice.
+_is_null_sink() {
+	local name="$1"
+	local factory
+	factory=$(pw-dump 2>/dev/null | jq -r --arg n "$name" '
+		[.[] | select(.info.props."node.name" == $n
+			and .info.props."media.class" == "Audio/Sink")
+		| .info.props."factory.name"] | .[0] // empty
+	')
+	[[ "$factory" == "support.null-audio-sink" ]]
+}
+
+# Keep capture clients (Sunshine, OBS, ...) that attached to our monitor
+# pinned to it.  When the default sink changes, WirePlumber/pipewire-pulse
+# moves capture streams that record a monitor over to the new default
+# sink's monitor — which would leak the entire local mix (including
+# excluded apps) into the stream instead of just the shared audio.
+manage_capture_streams() {
+	local mon_idx
+	mon_idx=$(pactl list short sources 2>/dev/null |
+		awk -v n="${SINK_NAME}.monitor" '$2 == n {print $1; exit}')
+	[[ -z "$mon_idx" ]] && return 0
+
+	local line idx rest src nn
+	local -A _seen=()
+	while IFS= read -r line; do
+		[[ -z "$line" ]] && continue
+		idx="${line%%:*}"
+		rest="${line#*:}"
+		src="${rest%%:*}"
+		nn="${rest#*:}"
+		_seen["$nn"]=1
+		if [[ "$src" == "$mon_idx" ]]; then
+			if [[ ! -v "PINNED_CAPTURES[$nn]" ]]; then
+				PINNED_CAPTURES["$nn"]=1
+				log "Pinning capture stream to ${SINK_NAME}.monitor: ${_B}${nn}${_N}"
+			fi
+		elif [[ -v "PINNED_CAPTURES[$nn]" ]]; then
+			if pactl move-source-output "$idx" "${SINK_NAME}.monitor" 2>/dev/null; then
+				log "  Re-pinned capture stream ${nn} (#${idx}) → ${SINK_NAME}.monitor"
+			fi
+		fi
+	done < <(pactl list source-outputs 2>/dev/null | awk '
+		/^Source Output #/ { idx = $3; gsub(/#/,"",idx); src = "" }
+		/^\tSource:/ { src = $2 }
+		/node\.name =/ {
+			nn = $0; gsub(/.*= "/,"",nn); gsub(/".*/,"",nn)
+			if (nn != "") print idx ":" src ":" nn
+		}
+	')
+
+	# Drop pinned names whose capture stream is gone
+	for nn in "${!PINNED_CAPTURES[@]}"; do
+		[[ -v "_seen[$nn]" ]] || unset "PINNED_CAPTURES[$nn]"
+	done
+}
+
+# Move sink-inputs that were pushed onto our virtual sink by a default-sink
+# hijack (WirePlumber routes streams to whatever the default is) back to the
+# real default output.  Streams the script placed there itself (mute-local
+# captures) are left alone.  In non-mute mode, NO sink-input belongs on our
+# sink: sharing works via supplementary pw-links only.
+_sweep_strays_from_sink() {
+	local our_idx
+	our_idx=$(pactl list short sinks 2>/dev/null |
+		awk -v n="$SINK_NAME" '$2 == n {print $1; exit}')
+	[[ -z "$our_idx" ]] && return 0
+
+	local target="${LAST_KNOWN_DEFAULT:-$STARTUP_DEFAULT_SINK}"
+	[[ -z "$target" || "$target" == "$SINK_NAME" ]] && return 0
+
+	local -A _keep=()
+	if [[ "$MUTE_LOCAL" == true ]]; then
+		local _nid
+		for _nid in "${!CAPTURED[@]}"; do
+			_keep["${CAPTURED[$_nid]}"]=1
+		done
+	fi
+
+	local line idx nn
+	while IFS= read -r line; do
+		[[ -z "$line" ]] && continue
+		idx="${line%%:*}"
+		nn="${line#*:}"
+		[[ -v "_keep[$nn]" ]] && continue
+		if pactl move-sink-input "$idx" "$target" 2>/dev/null; then
+			log "  Rescued sink-input #${idx} (${nn}) → ${target} (was hijacked onto ${SINK_NAME})"
+		fi
+	done < <(pactl list sink-inputs 2>/dev/null | awk -v oi="$our_idx" '
+		/^Sink Input #/ { idx = $3; gsub(/#/,"",idx); sink = "" }
+		/^\tSink:/ { sink = $2 }
+		/node\.name =/ {
+			nn = $0; gsub(/.*= "/,"",nn); gsub(/".*/,"",nn)
+			if (sink == oi && nn != "") print idx ":" nn
+		}
+	')
+}
+
+# Keep the default output on a real device.  External programs switch the
+# default to a virtual sink at any time (e.g. Sunshine sets the default to
+# "sink-sunshine-stereo" or to its capture sink every time a client
+# connects), which would route local audio into the void and pin unrelated
+# streams there.  Called once per poll cycle.
+guard_default_sink() {
+	manage_capture_streams
+
+	local cur
+	cur=$(pactl get-default-sink 2>/dev/null || true)
+	[[ -z "$cur" ]] && return 0
+
+	# Only re-evaluate what kind of sink the default is when it changed
+	if [[ "$cur" != "$_GUARD_LAST_CUR" ]]; then
+		_GUARD_LAST_CUR="$cur"
+		if [[ "$cur" == "$SINK_NAME" ]] || _is_null_sink "$cur"; then
+			_GUARD_CUR_VIRTUAL=true
+		else
+			_GUARD_CUR_VIRTUAL=false
+		fi
+	fi
+
+	if [[ "$_GUARD_CUR_VIRTUAL" == false ]]; then
+		# The default is a real output device — remember it, and clean up
+		# any streams left pinned to our sink by past hijacks.
+		LAST_KNOWN_DEFAULT="$cur"
+		DEFAULT_SHARE_BY_USER=false
+		_sweep_strays_from_sink
+		return 0
+	fi
+
+	# The default is a virtual sink.  Respect it when the user deliberately
+	# chose OUR sink in the TUI.
+	[[ "$cur" == "$SINK_NAME" && "$DEFAULT_SHARE_BY_USER" == true ]] && return 0
+
+	# Switch back to the last real output, if it still exists.
+	local target="${LAST_KNOWN_DEFAULT:-$STARTUP_DEFAULT_SINK}"
+	[[ -z "$target" || "$target" == "$SINK_NAME" || "$target" == "$cur" ]] && return 0
+	_is_null_sink "$target" && return 0
+	pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF "$target" || return 0
+	if pactl set-default-sink "$target" 2>/dev/null; then
+		warn "Default output was switched to ${cur} — restored → ${target}"
+		_sweep_strays_from_sink
+	fi
+}
+
 # Find the Owner Module ID for a sink by its pactl name.
 # Prints the numeric module ID, or nothing if not found.
 get_sink_module_id() {
@@ -581,6 +734,13 @@ get_sink_module_id() {
 }
 
 create_sink() {
+	# Remember the current default sink.  Creating a new sink makes the
+	# session manager (WirePlumber / pipewire-pulse) switch the default
+	# output to the newly appeared device; we restore it below so the
+	# user's output device is left untouched.
+	local saved_default
+	saved_default=$(pactl get-default-sink 2>/dev/null || true)
+
 	if sink_exists; then
 		# The sink already exists but we hold the lock, so it's a leftover
 		# from a crash that the PID-file recovery didn't catch (no PID file,
@@ -624,6 +784,18 @@ create_sink() {
 	pw-link -o 2>/dev/null | grep "^${SINK_NAME}:" | while IFS= read -r p; do
 		log "  monitor ${p}"
 	done
+
+	# Restore the default sink if creating our sink stole it.  Streams that
+	# follow the default are moved back by the session manager automatically.
+	local now_default
+	now_default=$(pactl get-default-sink 2>/dev/null || true)
+	if [[ -n "$saved_default" && "$now_default" != "$saved_default" ]]; then
+		if pactl set-default-sink "$saved_default" 2>/dev/null; then
+			log "Default sink restored → ${_B}${saved_default}${_N}"
+		else
+			warn "Default output was switched to '${now_default}' and could not be restored to '${saved_default}'"
+		fi
+	fi
 }
 
 remove_sink() {
@@ -954,10 +1126,13 @@ _build_sink_ch_map() {
 	' <<<"$_dump_ref")
 }
 
-# Remove only the pw-links that WE created (tracked in OUR_LINKS) from a
-# stream's output ports to our virtual sink.  Links that WirePlumber or other
-# software created (e.g. routing to our sink because it is the default) are
-# left intact so local playback is not disrupted.
+# Remove ALL pw-links from a stream's output ports to our virtual sink,
+# regardless of who created them.  WirePlumber links a stream straight to
+# our sink when the stream appears while the share sink is the default
+# output (or when the user routed it there manually); those links are not
+# tracked in OUR_LINKS but must also be removed, otherwise a "removed"
+# stream keeps playing into the share.  Links to *other* sinks (e.g. the
+# local headset) are never touched, so local playback is not disrupted.
 # Takes a PipeWire node object.id (numeric).
 # Sets _UNLINK_COUNT to the number of links actually removed.
 _UNLINK_COUNT=0
@@ -965,32 +1140,52 @@ unlink_stream_from_sink() {
 	local node_id="$1"
 	_UNLINK_COUNT=0
 
+	local dump
+	dump=$(pw-dump 2>/dev/null) || return 1
+
 	# Build a set of this node's output port IDs for fast lookup
 	local -A _node_ports=()
 	local _pid
 	while IFS= read -r _pid; do
 		[[ -n "$_pid" ]] && _node_ports["$_pid"]=1
-	done < <(pw-dump 2>/dev/null | jq -r --argjson nid "$node_id" '
+	done < <(jq -r --argjson nid "$node_id" '
 		.[] | select(.type == "PipeWire:Interface:Port"
 			and .info.direction == "output"
 			and .info.props."node.id" == $nid) | .id
-	')
+	' <<<"$dump")
 
-	local key out_id in_id link_err
-	for key in "${!OUR_LINKS[@]}"; do
-		out_id="${key%%|*}"
-		in_id="${key#*|}"
-		[[ -v "_node_ports[$out_id]" ]] || continue
+	# Build a set of our sink's input port IDs for fast lookup
+	local -A _sink_ports=()
+	while IFS= read -r _pid; do
+		[[ -n "$_pid" ]] && _sink_ports["$_pid"]=1
+	done < <(jq -r --arg name "$SINK_NAME" '
+		([.[] | select(.info.props."node.name" == $name) | .id] | .[0]) as $nid
+		| .[] | select(.type == "PipeWire:Interface:Port"
+			and .info.direction == "input"
+			and .info.props."node.id" == $nid) | .id
+	' <<<"$dump")
+
+	# Remove every link (whoever created it) between the two port sets
+	local out_id in_id link_err
+	while IFS=$'\t' read -r out_id in_id; do
+		[[ -n "$out_id" && -n "$in_id" ]] || continue
+		[[ -v "_node_ports[$out_id]" && -v "_sink_ports[$in_id]" ]] || continue
 
 		if link_err=$(pw-link -d "$out_id" "$in_id" 2>&1); then
 			log "  Unlinked port ${out_id} → ${in_id}"
 			((_UNLINK_COUNT++)) || true
-		else
-			if [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
-				warn "  Failed to unlink port ${out_id} → ${in_id}: ${link_err}"
-			fi
+		elif [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
+			warn "  Failed to unlink port ${out_id} → ${in_id}: ${link_err}"
 		fi
-		unset "OUR_LINKS[$key]"
+	done < <(jq -r '
+		.[] | select(.type == "PipeWire:Interface:Link")
+		| "\(.info."output-port-id")\t\(.info."input-port-id")"
+	' <<<"$dump")
+
+	# Drop our bookkeeping for this node regardless of who removed the link
+	local key
+	for key in "${!OUR_LINKS[@]}"; do
+		[[ -v "_node_ports[${key%%|*}]" ]] && unset "OUR_LINKS[$key]"
 	done
 }
 
@@ -1185,6 +1380,35 @@ restore_stream_from_sink() {
 	done <<<"$entries"
 }
 
+# If a stream's sink-input is pinned to our virtual sink (e.g. it appeared
+# while the share sink was the default output), move it back to the current
+# default sink.  Without this, WirePlumber would re-link the stream to our
+# sink right after we removed the links.  Unlike mute-local restore, nothing
+# is remembered — the stream simply goes back to the default output.
+_unpin_stream_from_sink() {
+	local node_name="$1"
+	local entries
+	entries=$(get_sink_input_indices "$node_name") || true
+	[[ -z "$entries" ]] && return 0
+
+	local entry idx current_sink current_sink_name live_default=""
+	while IFS= read -r entry; do
+		[[ -z "$entry" ]] && continue
+		idx="${entry%%:*}"
+		current_sink="${entry##*:}"
+		current_sink_name=$(get_sink_name_by_index "$current_sink")
+		[[ "$current_sink_name" == "$SINK_NAME" ]] || continue
+		[[ -z "$live_default" ]] && live_default=$(current_default_sink)
+		# If the share sink IS the default, the pin is intentional — leave it
+		[[ -z "$live_default" || "$live_default" == "$SINK_NAME" ]] && continue
+		if pactl move-sink-input "$idx" "$live_default" 2>/dev/null; then
+			log "  Moved sink-input #${idx} → ${live_default} (was pinned to ${SINK_NAME})"
+		else
+			debug "  Could not unpin sink-input #${idx} from ${SINK_NAME}"
+		fi
+	done <<<"$entries"
+}
+
 # ─── high-level capture / release ────────────────────────────────────────────
 
 capture_stream() {
@@ -1217,8 +1441,10 @@ release_stream() {
 	if [[ "$MUTE_LOCAL" == true ]]; then
 		[[ -n "$node_name" ]] && restore_stream_from_sink "$node_name"
 	else
-		# Remove the supplementary pw-links to our virtual sink.
+		# Remove all pw-links to our virtual sink, then unpin the stream if
+		# WirePlumber had routed it to our sink outright.
 		unlink_stream_from_sink "$node_id"
+		[[ -n "$node_name" ]] && _unpin_stream_from_sink "$node_name"
 	fi
 	unset "CAPTURED[$node_id]"
 }
@@ -1287,6 +1513,8 @@ scan_new_streams() {
 
 # Make sure links / moves haven't been undone (WirePlumber quirks, etc.)
 verify_existing_links() {
+	guard_default_sink
+
 	local stale=()
 
 	# Cache pw-dump once for all checks this cycle
@@ -1401,34 +1629,31 @@ cleanup() {
 	# Restore muted streams before removing the sink
 	if [[ "$MUTE_LOCAL" == true ]]; then
 		log "Restoring streams to default output …"
-		local live_default
-		live_default=$(current_default_sink)
 		for nid in "${!CAPTURED[@]}"; do
 			local node_name="${CAPTURED[$nid]}"
 			restore_stream_from_sink "$node_name"
 		done
-
-		# Belt-and-suspenders: move any remaining sink-inputs that point at our
-		# sink back to the default output.
-		local leftover
-		leftover=$(pactl list sink-inputs 2>/dev/null | awk -v s="$SINK_NAME" '
-			/^Sink Input #/ { idx = $3; gsub(/#/,"",idx) }
-			/node\.name =/ {
-				val = $0; gsub(/.*= "/,"",val); gsub(/".*/,"",val)
-				if (val == s) print idx
-			}
-		' || true)
-		while IFS= read -r idx; do
-			[[ -z "$idx" ]] && continue
-			pactl move-sink-input "$idx" "$live_default" 2>/dev/null &&
-				log "  Fallback-restored sink-input #${idx}" || true
-		done <<<"$leftover"
 	fi
+
+	# Belt-and-suspenders: move any sink-inputs that were hijacked onto our
+	# sink back to the default output.
+	_sweep_strays_from_sink
 
 	# Restore the original default source before removing the virtual source
 	if [[ "$SET_DEFAULT_SOURCE" == true && -n "$ORIGINAL_DEFAULT_SOURCE" ]]; then
 		log "Restoring default input device → ${ORIGINAL_DEFAULT_SOURCE}"
 		pactl set-default-source "$ORIGINAL_DEFAULT_SOURCE" 2>/dev/null || true
+	fi
+
+	# If our sink is still the default output, hand the default back to the
+	# real output device before unloading, so the session manager does not
+	# pick a random fallback.
+	if [[ "$(pactl get-default-sink 2>/dev/null || true)" == "$SINK_NAME" ]]; then
+		local restore_target="${LAST_KNOWN_DEFAULT:-$STARTUP_DEFAULT_SINK}"
+		if [[ -n "$restore_target" && "$restore_target" != "$SINK_NAME" ]]; then
+			log "Restoring default sink → ${restore_target}"
+			pactl set-default-sink "$restore_target" 2>/dev/null || true
+		fi
 	fi
 
 	# Release routed input devices
@@ -2073,6 +2298,7 @@ tui_menu_output() {
 				local sname sdesc
 				IFS=$'\t' read -r sname sdesc <<<"$rec"
 				if pactl set-default-sink "$sname" 2>/dev/null; then
+					[[ "$sname" == "$SINK_NAME" ]] && DEFAULT_SHARE_BY_USER=true
 					_tui_push_msg "Default sink → ${sdesc}"
 				else
 					_tui_push_msg "Failed to set default sink"
@@ -2087,6 +2313,7 @@ tui_menu_output() {
 				local sname sdesc
 				IFS=$'\t' read -r sname sdesc <<<"$rec"
 				if pactl set-default-sink "$sname" 2>/dev/null; then
+					[[ "$sname" == "$SINK_NAME" ]] && DEFAULT_SHARE_BY_USER=true
 					_tui_push_msg "Default sink → ${sdesc}"
 				else
 					_tui_push_msg "Failed to set default sink"
