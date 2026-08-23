@@ -419,7 +419,7 @@ streaming server compatible with Moonlight.
 > streams are not pinned into the share. Sunshine's capture stream is
 > pinned to `audio_share.monitor`, so it keeps receiving exactly the
 > shared audio instead of being dragged onto your real output's monitor.
-
+>
 > **Note:** when you stop pipewire-audio-share, the virtual sink and all
 > of its links are removed completely. If your Moonlight client still
 > hears audio afterwards, that is Sunshine re-acquiring the _default_
