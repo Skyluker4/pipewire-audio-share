@@ -351,6 +351,23 @@ The script queries the default sink **live** whenever it needs to restore
 a stream. If you switch from headphones to speakers while the script is
 running, cleanup will restore streams to the correct device.
 
+The default output is also **guarded**: some capture software (notably
+Sunshine, which sets the default sink to a virtual sink such as
+`sink-sunshine-stereo` or to its capture sink every time a client
+connects) can switch the default output away from your real device. Once
+per poll cycle the script notices any default that points at a virtual
+(null) sink and switches it back to your last real output device, so your
+local playback and per-app routing are undisturbed. Streams that got
+pinned to the share sink by such a hijack are moved back too. Setting the
+virtual sink as the default deliberately is still possible from the TUI's
+_Output_ menu.
+
+Capture clients (Sunshine, OBS, ...) that attach to the share's monitor
+are **pinned** to it: when a default-sink change would move them over to
+your real output's monitor — which would leak your entire local mix
+(including excluded apps) into the stream — they are moved back to the
+share's monitor automatically.
+
 ### Signal handling
 
 ```text
@@ -393,6 +410,21 @@ streaming server compatible with Moonlight.
 3. All desktop audio now streams to your Moonlight client. Add
    `-I` to limit which applications are shared, or
    `--mute-local` to silence local speakers while streaming.
+
+> **Note:** every time a client connects, Sunshine switches the system
+> default sink (to `sink-sunshine-stereo` or to its configured capture
+> sink) in order to locate the monitor to record. pipewire-audio-share
+> detects this and switches the default back to your real output within
+> one poll cycle, so your local audio is not hijacked and unrelated
+> streams are not pinned into the share. Sunshine's capture stream is
+> pinned to `audio_share.monitor`, so it keeps receiving exactly the
+> shared audio instead of being dragged onto your real output's monitor.
+>
+> **Note:** when you stop pipewire-audio-share, the virtual sink and all
+> of its links are removed completely. If your Moonlight client still
+> hears audio afterwards, that is Sunshine re-acquiring the _default_
+> output's monitor (your headphones/speakers) now that `audio_share` is
+> gone — end the stream from Moonlight or stop Sunshine to cut it.
 
 ### OBS Studio
 
@@ -478,6 +510,28 @@ name and unloads just that specific module (not all null sinks).
 - Check that your capture software is reading from the **monitor** source
   (`audio_share.monitor`), not the sink itself
 - Run with `-v` for verbose output to see exactly what's happening
+
+### A removed stream is still audible in the share
+
+If a stream appeared while the virtual sink was the system default (e.g.
+right after a Sunshine client connected), WirePlumber linked the stream to
+the share sink directly — outside of the links the script tracks. Releasing
+such a stream removes **all** of its links to the share sink (whoever
+created them) and moves it back to the current default output, so it can
+no longer be heard in the share. This applies to both the TUI toggle and
+"release all". Streams pinned to the share sink by a default-sink hijack
+are also moved back to your real output automatically once per poll cycle.
+
+### The stream contains my whole local mix / an echo of the remote side
+
+When the default sink changes, capture clients that record a monitor get
+moved to the new default's monitor by WirePlumber/pipewire-pulse. If that
+moves your capture client (Sunshine, ...) from `audio_share.monitor` to
+your headset/speaker monitor, the stream suddenly carries everything you
+hear locally — including apps excluded from the share (your friends hear
+themselves). The script pins every capture client that attaches to the
+share's monitor and moves it back automatically, so this can only leak
+for about one poll cycle per external default change.
 
 ### Volume is at 0% or muted
 
