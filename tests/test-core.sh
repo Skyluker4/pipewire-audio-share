@@ -377,6 +377,31 @@ case_unlink_query_failures() (
 	done
 )
 
+case_partial_unlink_failure() (
+	pw-dump() { make_graph; }
+	OUR_LINKS=(["101|201"]=1 ["102|202"]=1)
+	STREAM_LINKS=(["10|101|201"]=1 ["10|102|202"]=1)
+	pw-link() {
+		if [[ "$1" != -d ]]; then
+			fail "link repair recreated a partially removed stream link"
+		fi
+		if [[ "$2" == 102 ]]; then
+			printf 'denied' >&2
+			return 1
+		fi
+	}
+
+	assert_failure unlink_stream_from_sink 10
+	assert_eq 2 "${#OUR_LINKS[@]}" "partial unlink retained all links"
+	assert_eq 2 "${#STREAM_LINKS[@]}" "partial unlink retained node links"
+	assert_success link_stream_to_sink 10
+
+	pw-link() { :; }
+	assert_success unlink_stream_from_sink 10
+	assert_eq 0 "${#OUR_LINKS[@]}" "unlink retry cleared all links"
+	assert_eq 0 "${#STREAM_LINKS[@]}" "unlink retry cleared node links"
+)
+
 case_graph_edge_failures() (
 	pw-dump() {
 		cat <<-'JSON'
@@ -938,6 +963,7 @@ case_discovery_and_filters
 case_graph_linking
 case_graph_lookup_failure
 case_unlink_query_failures
+case_partial_unlink_failure
 case_graph_edge_failures
 case_input_linking
 case_route_inputs

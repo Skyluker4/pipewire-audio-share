@@ -1201,8 +1201,11 @@ unlink_stream_from_sink() {
 		fi
 	done <<<"$link_pairs"
 
-	# Drop bookkeeping for links that are gone, including vanished streams.
-	# Retain links that PipeWire explicitly refused to remove so they can retry.
+	# Keep every record after a partial failure. This prevents link verification
+	# from recreating channels that were removed before another channel failed.
+	((${#_failed_links[@]} == 0)) || return 1
+
+	# Drop bookkeeping only after the complete unlink operation succeeds.
 	local key stream_key stream_node stream_pair
 	for stream_key in "${!STREAM_LINKS[@]}"; do
 		stream_node="${stream_key%%|*}"
@@ -1218,7 +1221,6 @@ unlink_stream_from_sink() {
 			unset "OUR_LINKS[$key]"
 		fi
 	done
-	((${#_failed_links[@]} == 0)) || return 1
 	# A final nonmatching entry is not a failure, including for vanished streams.
 	return 0
 }
