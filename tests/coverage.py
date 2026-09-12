@@ -208,8 +208,14 @@ def executable_groups(lines: list[str]) -> tuple[set[int], dict[int, int]]:
         state = quote_state(cleaned)
 
         if heredoc:
-            end = heredoc_end(lines, index, heredoc.group("delimiter"))
-        elif array_match and not cleaned.rstrip().endswith(")"):
+            leader = index + 1
+            if is_relevant_line(lines[index]):
+                executable.add(leader)
+                owners[leader] = leader
+            finish_case_line(cleaned, case_labels)
+            index = heredoc_end(lines, index, heredoc.group("delimiter")) + 1
+            continue
+        if array_match and not cleaned.rstrip().endswith(")"):
             end = array_end(lines, index)
         elif state is not None:
             end = quote_end(lines, index, state)
@@ -240,6 +246,10 @@ def validate_parser() -> None:
     executable, _owners = executable_groups(sample)
     if 2 in executable or 3 not in executable:
         raise RuntimeError("case label detection hid an executable command")
+    heredoc = ["cat <<'EOF'", "payload", "EOF", "echo done"]
+    executable, _owners = executable_groups(heredoc)
+    if executable != {1, 4}:
+        raise RuntimeError("heredoc payload was classified as executable")
 
 
 def run_tests(root: Path, trace_path: Path, passes: int) -> int:
