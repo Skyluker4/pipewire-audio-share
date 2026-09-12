@@ -166,6 +166,35 @@ def continuation_end(lines: list[str], start: int) -> int:
     return index
 
 
+def case_label_tail(line: str) -> str | None:
+    """Return text after the first top-level case-label delimiter."""
+    state: str | None = None
+    escaped = False
+    parenthesis_depth = 0
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and state != "'":
+            escaped = True
+            continue
+        if state is None and character in {"'", '"', "`"}:
+            state = character
+            continue
+        if state == character:
+            state = None
+            continue
+        if state is not None:
+            continue
+        if character == "(":
+            parenthesis_depth += 1
+        elif character == ")" and parenthesis_depth > 0:
+            parenthesis_depth -= 1
+        elif character == ")":
+            return line[index + 1 :].strip()
+    return None
+
+
 def skip_case_structure(cleaned: str, case_labels: list[bool]) -> bool:
     """Update case state and identify non-executable structural lines."""
     if cleaned == "esac":
@@ -174,12 +203,11 @@ def skip_case_structure(cleaned: str, case_labels: list[bool]) -> bool:
         return True
     if not case_labels or not case_labels[-1]:
         return False
-    if cleaned.endswith(")"):
-        case_labels[-1] = False
-        return True
-    if ")" in cleaned:
-        case_labels[-1] = False
-    return False
+    tail = case_label_tail(cleaned)
+    if tail is None:
+        return False
+    case_labels[-1] = False
+    return not tail
 
 
 def finish_case_line(cleaned: str, case_labels: list[bool]) -> None:
@@ -246,6 +274,10 @@ def validate_parser() -> None:
     executable, _owners = executable_groups(sample)
     if 2 in executable or 3 not in executable:
         raise RuntimeError("case label detection hid an executable command")
+    one_line = ['case "$value" in', "choice) result=$(command)", ";;", "esac"]
+    executable, _owners = executable_groups(one_line)
+    if 2 not in executable:
+        raise RuntimeError("one-line case command was classified as a label")
     heredoc = ["cat <<'EOF'", "payload", "EOF", "echo done"]
     executable, _owners = executable_groups(heredoc)
     if executable != {1, 4}:

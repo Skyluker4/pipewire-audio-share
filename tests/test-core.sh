@@ -332,8 +332,11 @@ case_graph_linking() (
 		esac
 	}
 	OUR_LINKS=()
+	STREAM_LINKS=()
 	assert_success link_stream_to_sink 10
 	assert_eq 2 "${#OUR_LINKS[@]}" "stream links tracked"
+	assert_eq 2 "${#STREAM_LINKS[@]}" "stream links tracked by node"
+	[[ -v 'STREAM_LINKS[10|101|201]' && -v 'STREAM_LINKS[10|102|202]' ]] || fail "stream node link keys"
 	assert_success link_stream_to_sink 10
 	mode=exists
 	OUR_LINKS=()
