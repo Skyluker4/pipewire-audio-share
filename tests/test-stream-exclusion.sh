@@ -76,13 +76,24 @@ run_case() (
 	TUI_ACTIVE=true
 	CAPTURED=([10]=mpv [11]=mpv)
 	OUR_LINKS=(["101|201"]=1 ["102|202"]=1 ["111|201"]=1 ["112|202"]=1)
+	STREAM_LINKS=(
+		["10|101|201"]=1
+		["10|102|202"]=1
+		["11|111|201"]=1
+		["11|112|202"]=1
+	)
 	: >"$TEST_DIR/unlinked"
 
 	# Invoke normally, not in an if/|| context that would disable errexit.
 	tui_menu_streams <<<"$keys" 2>"$TEST_DIR/menu"
 	[[ ! -v "CAPTURED[$target]" && -v "MANUAL_REMOVE[$target]" ]] || fail "Selected stream was not excluded"
+	local stream_key
+	for stream_key in "${!STREAM_LINKS[@]}"; do
+		[[ "${stream_key%%|*}" != "$target" ]] || fail "Selected stream left node link bookkeeping"
+	done
 	if [[ "$other" == all ]]; then
 		[[ ${#CAPTURED[@]} == 0 && ${#MANUAL_REMOVE[@]} == 2 ]] || fail "Release all missed a stream"
+		[[ ${#STREAM_LINKS[@]} == 0 ]] || fail "Release all left node link bookkeeping"
 	else
 		[[ -v "CAPTURED[$other]" && ! -v "MANUAL_REMOVE[$other]" ]] || fail "Duplicate-named stream was also excluded"
 		local port

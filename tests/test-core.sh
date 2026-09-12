@@ -343,9 +343,11 @@ case_graph_linking() (
 	assert_failure link_stream_to_sink 10
 	assert_failure link_stream_to_sink 999
 	OUR_LINKS=(["101|201"]=1 ["102|202"]=1 ["111|201"]=1)
+	STREAM_LINKS=(["10|101|201"]=1 ["10|102|202"]=1)
 	mode=success
 	unlink_stream_from_sink 10
 	assert_eq 1 "${#OUR_LINKS[@]}" "only selected stream bookkeeping removed"
+	assert_eq 0 "${#STREAM_LINKS[@]}" "selected stream links removed"
 	assert_eq 2 "$_UNLINK_COUNT" "stream unlink count"
 )
 
@@ -399,8 +401,10 @@ case_graph_edge_failures() (
 	}
 	assert_failure link_input_to_sink mic.mono
 	OUR_LINKS=(["101|201"]=1 ["102|202"]=1)
+	STREAM_LINKS=(["10|101|201"]=1 ["10|102|202"]=1)
 	assert_failure unlink_stream_from_sink 10
 	assert_eq 2 "${#OUR_LINKS[@]}" "failed stream unlinks remain tracked"
+	assert_eq 2 "${#STREAM_LINKS[@]}" "failed stream links remain retryable"
 
 	pw-link() {
 		printf 'No such file' >&2
@@ -408,6 +412,7 @@ case_graph_edge_failures() (
 	}
 	assert_success unlink_stream_from_sink 10
 	assert_eq 0 "${#OUR_LINKS[@]}" "missing stream links clear bookkeeping"
+	assert_eq 0 "${#STREAM_LINKS[@]}" "missing stream links clear node map"
 
 	pw-link() {
 		printf 'File exists' >&2
@@ -562,9 +567,12 @@ case_source_lifecycle() (
 	SET_DEFAULT_SOURCE=true
 	SOURCE_NAME=share_input
 	SOURCE_DESCRIPTION='Share Input'
-	local dump_count=0
+	printf '0\n' >"$RUNTIME_DIR/dump-count"
 	pw-dump() {
+		local dump_count
+		read -r dump_count <"$RUNTIME_DIR/dump-count"
 		((++dump_count)) || true
+		printf '%s\n' "$dump_count" >"$RUNTIME_DIR/dump-count"
 		if ((dump_count == 1)); then
 			printf '[{"id":90,"info":{"props":{"node.name":"share_input"}}}]\n'
 		else
@@ -582,7 +590,7 @@ case_source_lifecycle() (
 	}
 	sleep() { :; }
 	create_source
-	assert_eq 90 "$SOURCE_MODULE_ID" "source node ID"
+	assert_eq 91 "$SOURCE_MODULE_ID" "new source node ID"
 	assert_eq old_input "$ORIGINAL_DEFAULT_SOURCE" "original source saved"
 	remove_source
 	assert_eq '' "$SOURCE_MODULE_ID" "source removed"
@@ -835,11 +843,15 @@ case_verify_links() (
 	link_stream_to_sink() { :; }
 	link_input_to_sink() { :; }
 	CAPTURED=([10]=mpv [99]=gone)
+	OUR_LINKS=(["991|201"]=1)
+	STREAM_LINKS=(["99|991|201"]=1)
 	SKIPPED=([98]=1 [11]=1)
 	CAPTURED_INPUTS=(["mic.mono"]=1 [missing]=1)
 	SKIP_RETRY_CTR=$((SKIP_RETRY_EVERY - 1))
 	verify_existing_links
 	[[ -v 'CAPTURED[10]' && ! -v 'CAPTURED[99]' ]] || fail "stale stream verification"
+	assert_eq 0 "${#OUR_LINKS[@]}" "stale stream link bookkeeping"
+	assert_eq 0 "${#STREAM_LINKS[@]}" "stale stream node bookkeeping"
 	assert_eq 0 "${#SKIPPED[@]}" "skipped stream retry"
 	[[ -v 'CAPTURED_INPUTS[mic.mono]' && ! -v 'CAPTURED_INPUTS[missing]' ]] || fail "input verification"
 )

@@ -49,6 +49,7 @@ declare -A CAPTURED=()        # node_id → node_name  (streams we are managing)
 declare -A SKIPPED=()         # node_id → "1"  (streams we skipped, e.g. peer-owned)
 declare -A MOVED_INPUTS=()    # pactl_index → original_sink  (for mute-local restore)
 declare -A OUR_LINKS=()       # "out_port_id|in_port_id" → 1  (links WE created)
+declare -A STREAM_LINKS=()    # "node_id|out_port_id|in_port_id" → 1
 declare -A CAPTURED_INPUTS=() # node_name → "1"  (input devices routed to our sink)
 declare -A MANUAL_ADD=()      # node_id → "1"  (user explicitly added via TUI)
 declare -A MANUAL_REMOVE=()   # node_id → "1"  (user explicitly removed via TUI)
@@ -1126,6 +1127,18 @@ _build_sink_ch_map() {
 	' <<<"$_dump_ref")
 }
 
+# Forget links created for a stream after its PipeWire node has disappeared.
+forget_stream_links() {
+	local node_id="$1"
+	local stream_key stream_pair
+	for stream_key in "${!STREAM_LINKS[@]}"; do
+		[[ "${stream_key%%|*}" == "$node_id" ]] || continue
+		stream_pair="${stream_key#*|}"
+		unset "OUR_LINKS[$stream_pair]"
+		unset "STREAM_LINKS[$stream_key]"
+	done
+}
+
 # Remove ALL pw-links from a stream's output ports to our virtual sink,
 # regardless of who created them.  WirePlumber links a stream straight to
 # our sink when the stream appears while the share sink is the default
@@ -1188,8 +1201,18 @@ unlink_stream_from_sink() {
 		fi
 	done <<<"$link_pairs"
 
-	# Drop bookkeeping for links that are gone, but retain failed links for retry.
-	local key
+	# Drop bookkeeping for links that are gone, including vanished streams.
+	# Retain links that PipeWire explicitly refused to remove so they can retry.
+	local key stream_key stream_node stream_pair
+	for stream_key in "${!STREAM_LINKS[@]}"; do
+		stream_node="${stream_key%%|*}"
+		[[ "$stream_node" == "$node_id" ]] || continue
+		stream_pair="${stream_key#*|}"
+		[[ -v "_failed_links[$stream_pair]" ]] && continue
+		unset "OUR_LINKS[$stream_pair]"
+		unset "STREAM_LINKS[$stream_key]"
+	done
+	# Also clean compatible bookkeeping created before STREAM_LINKS was populated.
 	for key in "${!OUR_LINKS[@]}"; do
 		if [[ -v "_node_ports[${key%%|*}]" && ! -v "_failed_links[$key]" ]]; then
 			unset "OUR_LINKS[$key]"
@@ -1241,8 +1264,10 @@ link_stream_to_sink() {
 		[[ -z "$in_id" ]] && in_id="${sink_ch["playback_FL"]:-}"
 		[[ -z "$in_id" ]] && continue
 
+		local pair="${out_id}|${in_id}"
 		# Already tracked by us?
-		if [[ -v "OUR_LINKS[${out_id}|${in_id}]" ]]; then
+		if [[ -v "OUR_LINKS[$pair]" ]]; then
+			STREAM_LINKS["${node_id}|${pair}"]=1
 			linked=true
 			continue
 		fi
@@ -1250,7 +1275,8 @@ link_stream_to_sink() {
 		local link_err
 		if link_err=$(pw-link "$out_id" "$in_id" 2>&1); then
 			log "  Linked port ${out_id} → ${in_id}"
-			OUR_LINKS["${out_id}|${in_id}"]=1
+			OUR_LINKS["$pair"]=1
+			STREAM_LINKS["${node_id}|${pair}"]=1
 			linked=true
 		elif [[ "$link_err" == *"File exists"* ]]; then
 			debug "  Link already present: port ${out_id} → ${in_id}"
@@ -1579,6 +1605,7 @@ verify_existing_links() {
 	done
 
 	for node_id in "${stale[@]}"; do
+		forget_stream_links "$node_id"
 		unset "CAPTURED[$node_id]"
 	done
 

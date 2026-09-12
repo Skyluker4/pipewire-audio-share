@@ -31,7 +31,9 @@ TRACE_PATTERN = re.compile(
 IGNORED_KEYWORDS = {
     "(",
     ")",
+    ";&",
     ";;",
+    ";;&",
     "do",
     "done",
     "elif",
@@ -44,14 +46,19 @@ IGNORED_KEYWORDS = {
     "{",
     "}",
 }
-FUNCTION_PATTERN = re.compile(r"^[A-Za-z_@][A-Za-z0-9_@.:-]*\(\)")
-CASE_SELECTOR_PATTERN = re.compile(r"^[^)]*\)$")
+SHELL_NAME_PATTERN = r"[A-Za-z_@][A-Za-z0-9_@.:-]*"
+FUNCTION_PATTERN = re.compile(
+    rf"^(?:{SHELL_NAME_PATTERN}\s*\(\)|"
+    + rf"function\s+{SHELL_NAME_PATTERN}(?:\s*\(\))?)\s*(?:\{{\s*)?$"
+)
+CASE_START_PATTERN = re.compile(r"^case(?:\s|$).*\bin\s*$")
+CASE_ENDINGS = (";;", ";&", ";;&")
 ARRAY_NAME_PATTERN = r"\b[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]+\])?"
 ARRAY_PATTERN = re.compile(ARRAY_NAME_PATTERN + r"\s*=\s*\(")
 HEREDOC_PATTERN = re.compile(
     r"<<-?\s*['\"]?(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)['\"]?"
 )
-INLINE_COMMENT_PATTERN = re.compile(r"\s+#.*$")
+COMMENT_BOUNDARIES = ";|&()"
 
 
 @dataclass(frozen=True)
@@ -65,8 +72,28 @@ class CoverageStats:
 
 
 def clean_shell_line(line: str) -> str:
-    """Remove a trailing shell comment and surrounding whitespace."""
-    return INLINE_COMMENT_PATTERN.sub("", line).strip()
+    """Remove an unquoted trailing shell comment and surrounding whitespace."""
+    state: str | None = None
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and state != "'":
+            escaped = True
+            continue
+        if state is None and character in {"'", '"', "`"}:
+            state = character
+            continue
+        if state == character:
+            state = None
+            continue
+        if character == "#" and state is None:
+            boundary = index == 0 or line[index - 1].isspace()
+            boundary = boundary or line[index - 1] in COMMENT_BOUNDARIES
+            if boundary:
+                return line[:index].strip()
+    return line.strip()
 
 
 def is_relevant_line(line: str) -> bool:
@@ -74,9 +101,9 @@ def is_relevant_line(line: str) -> bool:
     cleaned = clean_shell_line(line)
     if not cleaned or cleaned in IGNORED_KEYWORDS:
         return False
-    if cleaned.startswith(("#", "function ")):
+    if cleaned.startswith("#"):
         return False
-    if FUNCTION_PATTERN.match(cleaned) or CASE_SELECTOR_PATTERN.match(cleaned):
+    if FUNCTION_PATTERN.fullmatch(cleaned):
         return False
     return not cleaned.endswith("(")
 
@@ -92,7 +119,7 @@ def quote_state(text: str, initial: str | None = None) -> str | None:
         if character == "\\" and state != "'":
             escaped = True
             continue
-        if state is None and character in {"'", '"'}:
+        if state is None and character in {"'", '"', "`"}:
             state = character
         elif state == character:
             state = None
@@ -139,14 +166,42 @@ def continuation_end(lines: list[str], start: int) -> int:
     return index
 
 
+def skip_case_structure(cleaned: str, case_labels: list[bool]) -> bool:
+    """Update case state and identify non-executable structural lines."""
+    if cleaned == "esac":
+        if case_labels:
+            _ = case_labels.pop()
+        return True
+    if not case_labels or not case_labels[-1]:
+        return False
+    if cleaned.endswith(")"):
+        case_labels[-1] = False
+        return True
+    if ")" in cleaned:
+        case_labels[-1] = False
+    return False
+
+
+def finish_case_line(cleaned: str, case_labels: list[bool]) -> None:
+    """Update case state after processing an executable source line."""
+    if CASE_START_PATTERN.match(cleaned):
+        case_labels.append(True)
+    elif case_labels and cleaned.endswith(CASE_ENDINGS):
+        case_labels[-1] = True
+
+
 def executable_groups(lines: list[str]) -> tuple[set[int], dict[int, int]]:
     """Map physical source lines to executable logical command leaders."""
     executable: set[int] = set()
     owners: dict[int, int] = {}
+    case_labels: list[bool] = []
     index = 0
 
     while index < len(lines):
         cleaned = clean_shell_line(lines[index])
+        if skip_case_structure(cleaned, case_labels):
+            index += 1
+            continue
         end = index
         heredoc = HEREDOC_PATTERN.search(cleaned)
         array_match = ARRAY_PATTERN.search(cleaned)
@@ -166,9 +221,25 @@ def executable_groups(lines: list[str]) -> tuple[set[int], dict[int, int]]:
             for line_number in range(leader, end + 2):
                 executable.add(line_number)
                 owners[line_number] = leader
+        finish_case_line(cleaned, case_labels)
         index = end + 1
 
     return executable, owners
+
+
+def validate_parser() -> None:
+    """Check lexer behavior that protects the coverage denominator."""
+    quoted = 'debug "sink-input #${idx}" # trailing comment'
+    if clean_shell_line(quoted) != 'debug "sink-input #${idx}"':
+        raise RuntimeError("quoted comment marker was parsed as a comment")
+    if not is_relevant_line("_ts() { date '+%H:%M:%S'; }"):
+        raise RuntimeError("one-line function body was ignored")
+    if is_relevant_line("_ts() {"):
+        raise RuntimeError("standalone function header was executable")
+    sample = ['case "$value" in', "choice)", "cur=$(pactl info)", ";;", "esac"]
+    executable, _owners = executable_groups(sample)
+    if 2 in executable or 3 not in executable:
+        raise RuntimeError("case label detection hid an executable command")
 
 
 def run_tests(root: Path, trace_path: Path, passes: int) -> int:
@@ -422,6 +493,7 @@ def write_summary(path: Path, stats: CoverageStats, threshold: float) -> None:
 def main() -> int:
     """Run tests, emit reports, and enforce the configured threshold."""
     root = Path(__file__).resolve().parents[1]
+    validate_parser()
     source_path = root / "pipewire-audio-share.sh"
     coverage_dir = root / "coverage"
     threshold = float(os.environ.get("MINIMUM_COVERAGE", "95"))
