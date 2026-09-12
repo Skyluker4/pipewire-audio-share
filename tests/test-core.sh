@@ -379,7 +379,16 @@ case_graph_edge_failures() (
 		return 1
 	}
 	assert_failure link_input_to_sink mic.mono
+	OUR_LINKS=(["101|201"]=1 ["102|202"]=1)
+	assert_failure unlink_stream_from_sink 10
+	assert_eq 2 "${#OUR_LINKS[@]}" "failed stream unlinks remain tracked"
+
+	pw-link() {
+		printf 'No such file' >&2
+		return 1
+	}
 	assert_success unlink_stream_from_sink 10
+	assert_eq 0 "${#OUR_LINKS[@]}" "missing stream links clear bookkeeping"
 
 	pw-link() {
 		printf 'File exists' >&2
@@ -700,6 +709,16 @@ case_capture_stream_modes() (
 	restore_stream_from_sink() { :; }
 	release_stream 12
 	assert_failure test -v 'CAPTURED[12]'
+
+	MUTE_LOCAL=false
+	CAPTURED[14]=music
+	unlink_stream_from_sink() { return 1; }
+	assert_failure release_stream 14
+	assert_success test -v 'CAPTURED[14]'
+	unlink_stream_from_sink() { return 0; }
+	_unpin_stream_from_sink() { :; }
+	assert_success release_stream 14
+	assert_failure test -v 'CAPTURED[14]'
 )
 
 case_move_restore_streams() (

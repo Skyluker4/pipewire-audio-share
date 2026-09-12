@@ -125,12 +125,15 @@ case_tui_primitives() (
 )
 
 case_tui_prompt() (
-	exec 9<>"$TEST_DIR/tty"
-	printf 'answer\n' >&9
-	exec 9<&-
-	# Exercise the terminal prompt through a short-lived pseudo path substitute.
-	tui_show_cursor 2>"$TEST_DIR/prompt"
-	tui_hide_cursor 2>>"$TEST_DIR/prompt"
+	printf 'answer\n' >"$TEST_DIR/tty"
+	TUI_INPUT_PATH="$TEST_DIR/tty"
+	tui_prompt "Answer: " 2>"$TEST_DIR/prompt"
+	assert_eq answer "$TUI_REPLY" "prompt reply"
+
+	TUI_INPUT_PATH="$TEST_DIR/missing-tty"
+	TUI_REPLY=stale
+	tui_prompt "Unavailable: " 2>>"$TEST_DIR/prompt"
+	assert_eq '' "$TUI_REPLY" "failed prompt clears reply"
 )
 
 case_data_helpers() (
@@ -233,6 +236,33 @@ SPACE
 b
 KEYS
 	[[ -v 'MANUAL_REMOVE[10]' ]] || fail "zero-link stream was not released"
+)
+
+case_stream_release_failure() (
+	CAPTURED=([10]=mpv)
+	MANUAL_REMOVE=()
+	MANUAL_ADD=()
+	SKIPPED=()
+	local attempts=0
+	release_stream() {
+		((++attempts))
+		_UNLINK_COUNT=0
+		return 1
+	}
+	tui_refresh_streams() {
+		_TUI_STREAM_COUNT=1
+		_TUI_STREAMS=($'10\tmpv\tmpv\tcaptured\tMovie')
+	}
+	tui_menu_streams <<'KEYS' 2>"$TEST_DIR/streams-release-failure"
+SPACE
+1
+r
+b
+KEYS
+	assert_eq 3 "$attempts" "failed releases remain retryable"
+	[[ -v 'CAPTURED[10]' ]] || fail "failed release dropped capture state"
+	[[ ! -v 'MANUAL_REMOVE[10]' ]] || fail "failed release marked stream removed"
+	[[ "${TUI_MESSAGES[*]}" == *"retry available"* ]] || fail "failed release was not reported"
 )
 
 case_volume_menu() (
@@ -559,6 +589,7 @@ case_stream_statuses
 case_stream_actions
 case_empty_stream_menu
 case_stream_visual_and_no_link_states
+case_stream_release_failure
 case_volume_menu
 case_output_menu
 case_output_failures

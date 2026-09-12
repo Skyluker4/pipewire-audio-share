@@ -35,7 +35,7 @@ bundle install
 TEST_PASSES=3 MINIMUM_COVERAGE=90 bundle exec bashcov --skip-uncovered tests/run.sh
 ```
 
-The command writes an HTML report to `coverage/index.html` and a Cobertura report to `coverage/coverage.xml`.
+The command writes an HTML report to `coverage/index.html`, a Cobertura report to `coverage/coverage.xml`, and a machine-readable summary to `coverage/coverage.json`.
 
 ## Pull Requests
 

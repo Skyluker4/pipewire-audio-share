@@ -1167,6 +1167,7 @@ unlink_stream_from_sink() {
 
 	# Remove every link (whoever created it) between the two port sets
 	local out_id in_id link_err
+	local -A _failed_links=()
 	while IFS=$'\t' read -r out_id in_id; do
 		[[ -n "$out_id" && -n "$in_id" ]] || continue
 		[[ -v "_node_ports[$out_id]" && -v "_sink_ports[$in_id]" ]] || continue
@@ -1176,17 +1177,21 @@ unlink_stream_from_sink() {
 			((_UNLINK_COUNT++)) || true
 		elif [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
 			warn "  Failed to unlink port ${out_id} → ${in_id}: ${link_err}"
+			_failed_links["${out_id}|${in_id}"]=1
 		fi
 	done < <(jq -r '
 		.[] | select(.type == "PipeWire:Interface:Link")
 		| "\(.info."output-port-id")\t\(.info."input-port-id")"
 	' <<<"$dump")
 
-	# Drop our bookkeeping for this node regardless of who removed the link
+	# Drop bookkeeping for links that are gone, but retain failed links for retry.
 	local key
 	for key in "${!OUR_LINKS[@]}"; do
-		[[ -v "_node_ports[${key%%|*}]" ]] && unset "OUR_LINKS[$key]"
+		if [[ -v "_node_ports[${key%%|*}]" && ! -v "_failed_links[$key]" ]]; then
+			unset "OUR_LINKS[$key]"
+		fi
 	done
+	((${#_failed_links[@]} == 0)) || return 1
 	# A final nonmatching entry is not a failure, including for vanished streams.
 	return 0
 }
@@ -1445,10 +1450,11 @@ release_stream() {
 	else
 		# Remove all pw-links to our virtual sink, then unpin the stream if
 		# WirePlumber had routed it to our sink outright.
-		unlink_stream_from_sink "$node_id"
+		unlink_stream_from_sink "$node_id" || return 1
 		[[ -n "$node_name" ]] && _unpin_stream_from_sink "$node_name"
 	fi
 	unset "CAPTURED[$node_id]"
+	return 0
 }
 
 # ─── bulk operations ─────────────────────────────────────────────────────────
@@ -1714,12 +1720,13 @@ tui_hide_cursor() { printf '\033[?25l' >&2; }
 
 # Prompt on the controlling terminal. The result is returned in TUI_REPLY.
 TUI_REPLY=""
+TUI_INPUT_PATH="${TUI_INPUT_PATH:-/dev/tty}"
 tui_prompt() {
 	local prompt="$1"
 	tui_show_cursor
 	printf '\n  %s' "$prompt" >&2
 	TUI_REPLY=""
-	IFS= read -r TUI_REPLY </dev/tty 2>/dev/null || true
+	IFS= read -r TUI_REPLY <"$TUI_INPUT_PATH" 2>/dev/null || true
 	tui_hide_cursor
 }
 
@@ -2032,13 +2039,16 @@ tui_menu_streams() {
 			local nid nn an st mn
 			IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 			if [[ "$st" == "captured" ]]; then
-				release_stream "$nid"
-				MANUAL_REMOVE["$nid"]=1
-				unset "MANUAL_ADD[$nid]"
-				if ((_UNLINK_COUNT > 0)); then
-					_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+				if release_stream "$nid"; then
+					MANUAL_REMOVE["$nid"]=1
+					unset "MANUAL_ADD[$nid]"
+					if ((_UNLINK_COUNT > 0)); then
+						_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+					else
+						_tui_push_msg "Released: ${an:-$nn} (no links found to remove!)"
+					fi
 				else
-					_tui_push_msg "Released: ${an:-$nn} (no links found to remove!)"
+					_tui_push_msg "Could not fully release: ${an:-$nn} (retry available)"
 				fi
 			else
 				unset "MANUAL_REMOVE[$nid]"
@@ -2055,13 +2065,16 @@ tui_menu_streams() {
 				local nid nn an st mn
 				IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 				if [[ "$st" == "captured" ]]; then
-					release_stream "$nid"
-					MANUAL_REMOVE["$nid"]=1
-					unset "MANUAL_ADD[$nid]"
-					if ((_UNLINK_COUNT > 0)); then
-						_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+					if release_stream "$nid"; then
+						MANUAL_REMOVE["$nid"]=1
+						unset "MANUAL_ADD[$nid]"
+						if ((_UNLINK_COUNT > 0)); then
+							_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+						else
+							_tui_push_msg "Released: ${an:-$nn} (no links found!)"
+						fi
 					else
-						_tui_push_msg "Released: ${an:-$nn} (no links found!)"
+						_tui_push_msg "Could not fully release: ${an:-$nn} (retry available)"
 					fi
 				else
 					unset "MANUAL_REMOVE[$nid]"
@@ -2088,14 +2101,21 @@ tui_menu_streams() {
 			_tui_push_msg "Added all streams"
 			;;
 		r | R)
-			local total_unlinked=0
+			local total_unlinked=0 release_failures=0
 			for nid in "${!CAPTURED[@]}"; do
-				release_stream "$nid"
-				MANUAL_REMOVE["$nid"]=1
-				unset "MANUAL_ADD[$nid]"
-				((total_unlinked += _UNLINK_COUNT)) || true
+				if release_stream "$nid"; then
+					MANUAL_REMOVE["$nid"]=1
+					unset "MANUAL_ADD[$nid]"
+					((total_unlinked += _UNLINK_COUNT)) || true
+				else
+					((release_failures++)) || true
+				fi
 			done
-			_tui_push_msg "Released all streams (${total_unlinked} links removed)"
+			if ((release_failures > 0)); then
+				_tui_push_msg "Released streams with ${release_failures} failure(s); retry available"
+			else
+				_tui_push_msg "Released all streams (${total_unlinked} links removed)"
+			fi
 			;;
 		b | B | ESC | q | Q)
 			return
