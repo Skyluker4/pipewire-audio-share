@@ -49,6 +49,7 @@ declare -A CAPTURED=()        # node_id → node_name  (streams we are managing)
 declare -A SKIPPED=()         # node_id → "1"  (streams we skipped, e.g. peer-owned)
 declare -A MOVED_INPUTS=()    # pactl_index → original_sink  (for mute-local restore)
 declare -A OUR_LINKS=()       # "out_port_id|in_port_id" → 1  (links WE created)
+declare -A STREAM_LINKS=()    # "node_id|out_port_id|in_port_id" → 1
 declare -A CAPTURED_INPUTS=() # node_name → "1"  (input devices routed to our sink)
 declare -A MANUAL_ADD=()      # node_id → "1"  (user explicitly added via TUI)
 declare -A MANUAL_REMOVE=()   # node_id → "1"  (user explicitly removed via TUI)
@@ -1126,6 +1127,18 @@ _build_sink_ch_map() {
 	' <<<"$_dump_ref")
 }
 
+# Forget links created for a stream after its PipeWire node has disappeared.
+forget_stream_links() {
+	local node_id="$1"
+	local stream_key stream_pair
+	for stream_key in "${!STREAM_LINKS[@]}"; do
+		[[ "${stream_key%%|*}" == "$node_id" ]] || continue
+		stream_pair="${stream_key#*|}"
+		unset "OUR_LINKS[$stream_pair]"
+		unset "STREAM_LINKS[$stream_key]"
+	done
+}
+
 # Remove ALL pw-links from a stream's output ports to our virtual sink,
 # regardless of who created them.  WirePlumber links a stream straight to
 # our sink when the stream appears while the share sink is the default
@@ -1145,28 +1158,36 @@ unlink_stream_from_sink() {
 
 	# Build a set of this node's output port IDs for fast lookup
 	local -A _node_ports=()
-	local _pid
-	while IFS= read -r _pid; do
-		[[ -n "$_pid" ]] && _node_ports["$_pid"]=1
-	done < <(jq -r --argjson nid "$node_id" '
+	local _pid node_port_ids
+	node_port_ids=$(jq -r --argjson nid "$node_id" '
 		.[] | select(.type == "PipeWire:Interface:Port"
 			and .info.direction == "output"
 			and .info.props."node.id" == $nid) | .id
-	' <<<"$dump")
+	' <<<"$dump") || return 1
+	while IFS= read -r _pid; do
+		[[ -n "$_pid" ]] && _node_ports["$_pid"]=1
+	done <<<"$node_port_ids"
 
 	# Build a set of our sink's input port IDs for fast lookup
 	local -A _sink_ports=()
-	while IFS= read -r _pid; do
-		[[ -n "$_pid" ]] && _sink_ports["$_pid"]=1
-	done < <(jq -r --arg name "$SINK_NAME" '
+	local sink_port_ids
+	sink_port_ids=$(jq -r --arg name "$SINK_NAME" '
 		([.[] | select(.info.props."node.name" == $name) | .id] | .[0]) as $nid
 		| .[] | select(.type == "PipeWire:Interface:Port"
 			and .info.direction == "input"
 			and .info.props."node.id" == $nid) | .id
-	' <<<"$dump")
+	' <<<"$dump") || return 1
+	while IFS= read -r _pid; do
+		[[ -n "$_pid" ]] && _sink_ports["$_pid"]=1
+	done <<<"$sink_port_ids"
 
 	# Remove every link (whoever created it) between the two port sets
-	local out_id in_id link_err
+	local out_id in_id link_err link_pairs
+	link_pairs=$(jq -r '
+		.[] | select(.type == "PipeWire:Interface:Link")
+		| "\(.info."output-port-id")\t\(.info."input-port-id")"
+	' <<<"$dump") || return 1
+	local -A _failed_links=()
 	while IFS=$'\t' read -r out_id in_id; do
 		[[ -n "$out_id" && -n "$in_id" ]] || continue
 		[[ -v "_node_ports[$out_id]" && -v "_sink_ports[$in_id]" ]] || continue
@@ -1176,17 +1197,32 @@ unlink_stream_from_sink() {
 			((_UNLINK_COUNT++)) || true
 		elif [[ "$link_err" != *"No such file"* && "$link_err" != *"not found"* ]]; then
 			warn "  Failed to unlink port ${out_id} → ${in_id}: ${link_err}"
+			_failed_links["${out_id}|${in_id}"]=1
 		fi
-	done < <(jq -r '
-		.[] | select(.type == "PipeWire:Interface:Link")
-		| "\(.info."output-port-id")\t\(.info."input-port-id")"
-	' <<<"$dump")
+	done <<<"$link_pairs"
 
-	# Drop our bookkeeping for this node regardless of who removed the link
-	local key
-	for key in "${!OUR_LINKS[@]}"; do
-		[[ -v "_node_ports[${key%%|*}]" ]] && unset "OUR_LINKS[$key]"
+	# Keep every record after a partial failure. This prevents link verification
+	# from recreating channels that were removed before another channel failed.
+	((${#_failed_links[@]} == 0)) || return 1
+
+	# Drop bookkeeping only after the complete unlink operation succeeds.
+	local key stream_key stream_node stream_pair
+	for stream_key in "${!STREAM_LINKS[@]}"; do
+		stream_node="${stream_key%%|*}"
+		[[ "$stream_node" == "$node_id" ]] || continue
+		stream_pair="${stream_key#*|}"
+		[[ -v "_failed_links[$stream_pair]" ]] && continue
+		unset "OUR_LINKS[$stream_pair]"
+		unset "STREAM_LINKS[$stream_key]"
 	done
+	# Also clean compatible bookkeeping created before STREAM_LINKS was populated.
+	for key in "${!OUR_LINKS[@]}"; do
+		if [[ -v "_node_ports[${key%%|*}]" && ! -v "_failed_links[$key]" ]]; then
+			unset "OUR_LINKS[$key]"
+		fi
+	done
+	# A final nonmatching entry is not a failure, including for vanished streams.
+	return 0
 }
 
 # Create additional pw-links from a stream's output ports to our sink.
@@ -1230,8 +1266,10 @@ link_stream_to_sink() {
 		[[ -z "$in_id" ]] && in_id="${sink_ch["playback_FL"]:-}"
 		[[ -z "$in_id" ]] && continue
 
+		local pair="${out_id}|${in_id}"
 		# Already tracked by us?
-		if [[ -v "OUR_LINKS[${out_id}|${in_id}]" ]]; then
+		if [[ -v "OUR_LINKS[$pair]" ]]; then
+			STREAM_LINKS["${node_id}|${pair}"]=1
 			linked=true
 			continue
 		fi
@@ -1239,7 +1277,8 @@ link_stream_to_sink() {
 		local link_err
 		if link_err=$(pw-link "$out_id" "$in_id" 2>&1); then
 			log "  Linked port ${out_id} → ${in_id}"
-			OUR_LINKS["${out_id}|${in_id}"]=1
+			OUR_LINKS["$pair"]=1
+			STREAM_LINKS["${node_id}|${pair}"]=1
 			linked=true
 		elif [[ "$link_err" == *"File exists"* ]]; then
 			debug "  Link already present: port ${out_id} → ${in_id}"
@@ -1443,10 +1482,11 @@ release_stream() {
 	else
 		# Remove all pw-links to our virtual sink, then unpin the stream if
 		# WirePlumber had routed it to our sink outright.
-		unlink_stream_from_sink "$node_id"
+		unlink_stream_from_sink "$node_id" || return 1
 		[[ -n "$node_name" ]] && _unpin_stream_from_sink "$node_name"
 	fi
 	unset "CAPTURED[$node_id]"
+	return 0
 }
 
 # ─── bulk operations ─────────────────────────────────────────────────────────
@@ -1567,6 +1607,7 @@ verify_existing_links() {
 	done
 
 	for node_id in "${stale[@]}"; do
+		forget_stream_links "$node_id"
 		unset "CAPTURED[$node_id]"
 	done
 
@@ -1709,6 +1750,18 @@ tui_goto() { printf '\033[%d;%dH' "$1" "$2" >&2; } # row col (1-based)
 tui_el() { printf '\033[K' >&2; }                  # erase to end of line
 tui_show_cursor() { printf '\033[?25h' >&2; }
 tui_hide_cursor() { printf '\033[?25l' >&2; }
+
+# Prompt on the controlling terminal. The result is returned in TUI_REPLY.
+TUI_REPLY=""
+TUI_INPUT_PATH="${TUI_INPUT_PATH:-/dev/tty}"
+tui_prompt() {
+	local prompt="$1"
+	tui_show_cursor
+	printf '\n  %s' "$prompt" >&2
+	TUI_REPLY=""
+	IFS= read -r TUI_REPLY <"$TUI_INPUT_PATH" 2>/dev/null || true
+	tui_hide_cursor
+}
 
 tui_size() {
 	TERM_COLS=$(tput cols 2>/dev/null || echo 80)
@@ -2019,13 +2072,16 @@ tui_menu_streams() {
 			local nid nn an st mn
 			IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 			if [[ "$st" == "captured" ]]; then
-				release_stream "$nid"
-				MANUAL_REMOVE["$nid"]=1
-				unset "MANUAL_ADD[$nid]"
-				if ((_UNLINK_COUNT > 0)); then
-					_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+				if release_stream "$nid"; then
+					MANUAL_REMOVE["$nid"]=1
+					unset "MANUAL_ADD[$nid]"
+					if ((_UNLINK_COUNT > 0)); then
+						_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+					else
+						_tui_push_msg "Released: ${an:-$nn} (no links found to remove!)"
+					fi
 				else
-					_tui_push_msg "Released: ${an:-$nn} (no links found to remove!)"
+					_tui_push_msg "Could not fully release: ${an:-$nn} (retry available)"
 				fi
 			else
 				unset "MANUAL_REMOVE[$nid]"
@@ -2042,13 +2098,16 @@ tui_menu_streams() {
 				local nid nn an st mn
 				IFS=$'\t' read -r nid nn an st mn <<<"$rec"
 				if [[ "$st" == "captured" ]]; then
-					release_stream "$nid"
-					MANUAL_REMOVE["$nid"]=1
-					unset "MANUAL_ADD[$nid]"
-					if ((_UNLINK_COUNT > 0)); then
-						_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+					if release_stream "$nid"; then
+						MANUAL_REMOVE["$nid"]=1
+						unset "MANUAL_ADD[$nid]"
+						if ((_UNLINK_COUNT > 0)); then
+							_tui_push_msg "Released: ${an:-$nn} (${_UNLINK_COUNT} links removed)"
+						else
+							_tui_push_msg "Released: ${an:-$nn} (no links found!)"
+						fi
 					else
-						_tui_push_msg "Released: ${an:-$nn} (no links found!)"
+						_tui_push_msg "Could not fully release: ${an:-$nn} (retry available)"
 					fi
 				else
 					unset "MANUAL_REMOVE[$nid]"
@@ -2075,14 +2134,21 @@ tui_menu_streams() {
 			_tui_push_msg "Added all streams"
 			;;
 		r | R)
-			local total_unlinked=0
+			local total_unlinked=0 release_failures=0
 			for nid in "${!CAPTURED[@]}"; do
-				release_stream "$nid"
-				MANUAL_REMOVE["$nid"]=1
-				unset "MANUAL_ADD[$nid]"
-				((total_unlinked += _UNLINK_COUNT)) || true
+				if release_stream "$nid"; then
+					MANUAL_REMOVE["$nid"]=1
+					unset "MANUAL_ADD[$nid]"
+					((total_unlinked += _UNLINK_COUNT)) || true
+				else
+					((release_failures++)) || true
+				fi
 			done
-			_tui_push_msg "Released all streams (${total_unlinked} links removed)"
+			if ((release_failures > 0)); then
+				_tui_push_msg "Released streams with ${release_failures} failure(s); retry available"
+			else
+				_tui_push_msg "Released all streams (${total_unlinked} links removed)"
+			fi
 			;;
 		b | B | ESC | q | Q)
 			return
@@ -2488,11 +2554,8 @@ tui_menu_config() {
 			fi
 			;;
 		p | P)
-			tui_show_cursor
-			printf '\n  New poll interval (seconds): ' >&2
-			local new_val=""
-			IFS= read -r new_val </dev/tty 2>/dev/null || true
-			tui_hide_cursor
+			tui_prompt "New poll interval (seconds): "
+			local new_val="$TUI_REPLY"
 			if [[ "$new_val" =~ ^[0-9]+\.?[0-9]*$ ]] && [[ "$new_val" != "0" ]]; then
 				POLL_INTERVAL="$new_val"
 				_tui_push_msg "Poll interval → ${new_val}s"
@@ -2501,11 +2564,8 @@ tui_menu_config() {
 			fi
 			;;
 		w | W)
-			tui_show_cursor
-			printf '\n  Include (comma-separated, empty to clear): ' >&2
-			local new_val=""
-			IFS= read -r new_val </dev/tty 2>/dev/null || true
-			tui_hide_cursor
+			tui_prompt "Include (comma-separated, empty to clear): "
+			local new_val="$TUI_REPLY"
 			if [[ -z "$new_val" ]]; then
 				INCLUDE=()
 				_tui_push_msg "Include cleared"
@@ -2516,11 +2576,8 @@ tui_menu_config() {
 			fi
 			;;
 		e | E)
-			tui_show_cursor
-			printf '\n  Exclude (comma-separated, empty to clear): ' >&2
-			local new_val=""
-			IFS= read -r new_val </dev/tty 2>/dev/null || true
-			tui_hide_cursor
+			tui_prompt "Exclude (comma-separated, empty to clear): "
+			local new_val="$TUI_REPLY"
 			if [[ -z "$new_val" ]]; then
 				EXCLUDE=()
 				_tui_push_msg "Exclude cleared"
@@ -2951,4 +3008,6 @@ main() {
 	fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi
