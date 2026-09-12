@@ -20,10 +20,6 @@ indent_style = space
 indent_size = unset
 trim_trailing_whitespace = false
 
-[*.rb]
+[*.py]
 indent_style = space
-indent_size = 2
-
-[{Gemfile,.simplecov}]
-indent_style = space
-indent_size = 2
+indent_size = 4

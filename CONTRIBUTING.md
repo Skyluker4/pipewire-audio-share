@@ -28,14 +28,13 @@ bash tests/test-stream-exclusion.sh
 
 ### Coverage
 
-Coverage requires Ruby and Bundler. Install the locked dependencies, run the suite through Bashcov, and enforce the same 90% minimum line coverage used by CI:
+Coverage uses Bash execution tracing and the Python 3 standard library. Run the suite with the same 95% minimum line coverage used by CI:
 
 ```sh
-bundle install
-TEST_PASSES=3 MINIMUM_COVERAGE=90 bundle exec bashcov --skip-uncovered tests/run.sh
+TEST_PASSES=3 MINIMUM_COVERAGE=95 python3 tests/coverage.py
 ```
 
-The command writes an HTML report to `coverage/index.html`, a Cobertura report to `coverage/coverage.xml`, and a machine-readable summary to `coverage/coverage.json`.
+The command writes an HTML report to `coverage/index.html`, a Cobertura report to `coverage/coverage.xml`, a machine-readable report to `coverage/coverage.json`, and a Markdown summary to `coverage/summary.md`. No Python packages or other coverage dependencies are required.
 
 ## Pull Requests
 
