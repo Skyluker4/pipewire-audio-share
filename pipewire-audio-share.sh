@@ -1145,28 +1145,35 @@ unlink_stream_from_sink() {
 
 	# Build a set of this node's output port IDs for fast lookup
 	local -A _node_ports=()
-	local _pid
-	while IFS= read -r _pid; do
-		[[ -n "$_pid" ]] && _node_ports["$_pid"]=1
-	done < <(jq -r --argjson nid "$node_id" '
+	local _pid node_port_ids
+	node_port_ids=$(jq -r --argjson nid "$node_id" '
 		.[] | select(.type == "PipeWire:Interface:Port"
 			and .info.direction == "output"
 			and .info.props."node.id" == $nid) | .id
-	' <<<"$dump")
+	' <<<"$dump") || return 1
+	while IFS= read -r _pid; do
+		[[ -n "$_pid" ]] && _node_ports["$_pid"]=1
+	done <<<"$node_port_ids"
 
 	# Build a set of our sink's input port IDs for fast lookup
 	local -A _sink_ports=()
-	while IFS= read -r _pid; do
-		[[ -n "$_pid" ]] && _sink_ports["$_pid"]=1
-	done < <(jq -r --arg name "$SINK_NAME" '
+	local sink_port_ids
+	sink_port_ids=$(jq -r --arg name "$SINK_NAME" '
 		([.[] | select(.info.props."node.name" == $name) | .id] | .[0]) as $nid
 		| .[] | select(.type == "PipeWire:Interface:Port"
 			and .info.direction == "input"
 			and .info.props."node.id" == $nid) | .id
-	' <<<"$dump")
+	' <<<"$dump") || return 1
+	while IFS= read -r _pid; do
+		[[ -n "$_pid" ]] && _sink_ports["$_pid"]=1
+	done <<<"$sink_port_ids"
 
 	# Remove every link (whoever created it) between the two port sets
-	local out_id in_id link_err
+	local out_id in_id link_err link_pairs
+	link_pairs=$(jq -r '
+		.[] | select(.type == "PipeWire:Interface:Link")
+		| "\(.info."output-port-id")\t\(.info."input-port-id")"
+	' <<<"$dump") || return 1
 	local -A _failed_links=()
 	while IFS=$'\t' read -r out_id in_id; do
 		[[ -n "$out_id" && -n "$in_id" ]] || continue
@@ -1179,10 +1186,7 @@ unlink_stream_from_sink() {
 			warn "  Failed to unlink port ${out_id} → ${in_id}: ${link_err}"
 			_failed_links["${out_id}|${in_id}"]=1
 		fi
-	done < <(jq -r '
-		.[] | select(.type == "PipeWire:Interface:Link")
-		| "\(.info."output-port-id")\t\(.info."input-port-id")"
-	' <<<"$dump")
+	done <<<"$link_pairs"
 
 	# Drop bookkeeping for links that are gone, but retain failed links for retry.
 	local key

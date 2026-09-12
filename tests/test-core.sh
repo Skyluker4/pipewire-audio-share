@@ -356,6 +356,25 @@ case_graph_lookup_failure() (
 	assert_failure link_input_to_sink mic
 )
 
+case_unlink_query_failures() (
+	pw-dump() { make_graph; }
+	local fail_on
+	jq() {
+		case "$fail_on:$*" in
+		node:*'--argjson nid'*) return 1 ;;
+		sink:*'--arg name'*) return 1 ;;
+		links:*-r*)
+			[[ "$*" == *'--arg'* ]] || return 1
+			;;
+		esac
+		command jq "$@"
+	}
+
+	for fail_on in node sink links; do
+		assert_failure unlink_stream_from_sink 10
+	done
+)
+
 case_graph_edge_failures() (
 	pw-dump() {
 		cat <<-'JSON'
@@ -906,6 +925,7 @@ case_empty_status_and_entrypoint
 case_discovery_and_filters
 case_graph_linking
 case_graph_lookup_failure
+case_unlink_query_failures
 case_graph_edge_failures
 case_input_linking
 case_route_inputs
