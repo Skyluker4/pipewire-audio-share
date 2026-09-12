@@ -1,0 +1,27 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    bashcov (4.0.0)
+      simplecov (~> 1.1)
+    rexml (3.4.4)
+    simplecov (1.2.0)
+    simplecov-cobertura (4.0.0)
+      rexml
+      simplecov (~> 1.0)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  bashcov (= 4.0.0)
+  simplecov-cobertura (= 4.0.0)
+
+CHECKSUMS
+  bashcov (4.0.0) sha256=de056ab2513fe960d2eba7f3963d36cafa0479b88f4d56ca238048176690e5ba
+  rexml (3.4.4) sha256=19e0a2c3425dfbf2d4fc1189747bdb2f849b6c5e74180401b15734bc97b5d142
+  simplecov (1.2.0) sha256=ea6acd05eece5a41990e2a5171c57d15700d329326c7666c85ee8c6a0dd0977e
+  simplecov-cobertura (4.0.0) sha256=e4fb3159b1ecea545b44f5452a8611305323e78ad23eae8aed35924d072e01ea
+
+BUNDLED WITH
+  4.0.4

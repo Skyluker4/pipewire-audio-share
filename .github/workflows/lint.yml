@@ -1,5 +1,5 @@
 ---
-name: Lint
+name: CI
 
 on:
   push:
@@ -9,12 +9,49 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 jobs:
+  test:
+    name: Tests and coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Run tests with coverage
+        env:
+          MINIMUM_COVERAGE: "90"
+          TEST_PASSES: "3"
+        run: bundle exec bashcov --skip-uncovered tests/run.sh
+
+      - name: Report coverage
+        if: always() && hashFiles('coverage/coverage.json') != ''
+        run: |
+          ruby -rjson -e 'item = JSON.parse(File.read("coverage/coverage.json")).fetch("coverage").fetch("pipewire-audio-share.sh"); printf "## Test coverage\n\nLine coverage: **%.2f%%** (%d / %d lines)\n", item.fetch("lines_covered_percent"), item.fetch("covered_lines"), item.fetch("total_lines")' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always() && hashFiles('coverage/**') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: error
+          retention-days: 14
+
   lint:
     name: Super-Linter
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      statuses: write
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

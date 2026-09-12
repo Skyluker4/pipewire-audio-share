@@ -1187,6 +1187,8 @@ unlink_stream_from_sink() {
 	for key in "${!OUR_LINKS[@]}"; do
 		[[ -v "_node_ports[${key%%|*}]" ]] && unset "OUR_LINKS[$key]"
 	done
+	# A final nonmatching entry is not a failure, including for vanished streams.
+	return 0
 }
 
 # Create additional pw-links from a stream's output ports to our sink.
@@ -1709,6 +1711,17 @@ tui_goto() { printf '\033[%d;%dH' "$1" "$2" >&2; } # row col (1-based)
 tui_el() { printf '\033[K' >&2; }                  # erase to end of line
 tui_show_cursor() { printf '\033[?25h' >&2; }
 tui_hide_cursor() { printf '\033[?25l' >&2; }
+
+# Prompt on the controlling terminal. The result is returned in TUI_REPLY.
+TUI_REPLY=""
+tui_prompt() {
+	local prompt="$1"
+	tui_show_cursor
+	printf '\n  %s' "$prompt" >&2
+	TUI_REPLY=""
+	IFS= read -r TUI_REPLY </dev/tty 2>/dev/null || true
+	tui_hide_cursor
+}
 
 tui_size() {
 	TERM_COLS=$(tput cols 2>/dev/null || echo 80)
@@ -2488,11 +2501,8 @@ tui_menu_config() {
 			fi
 			;;
 		p | P)
-			tui_show_cursor
-			printf '\n  New poll interval (seconds): ' >&2
-			local new_val=""
-			IFS= read -r new_val </dev/tty 2>/dev/null || true
-			tui_hide_cursor
+			tui_prompt "New poll interval (seconds): "
+			local new_val="$TUI_REPLY"
 			if [[ "$new_val" =~ ^[0-9]+\.?[0-9]*$ ]] && [[ "$new_val" != "0" ]]; then
 				POLL_INTERVAL="$new_val"
 				_tui_push_msg "Poll interval → ${new_val}s"
@@ -2501,11 +2511,8 @@ tui_menu_config() {
 			fi
 			;;
 		w | W)
-			tui_show_cursor
-			printf '\n  Include (comma-separated, empty to clear): ' >&2
-			local new_val=""
-			IFS= read -r new_val </dev/tty 2>/dev/null || true
-			tui_hide_cursor
+			tui_prompt "Include (comma-separated, empty to clear): "
+			local new_val="$TUI_REPLY"
 			if [[ -z "$new_val" ]]; then
 				INCLUDE=()
 				_tui_push_msg "Include cleared"
@@ -2516,11 +2523,8 @@ tui_menu_config() {
 			fi
 			;;
 		e | E)
-			tui_show_cursor
-			printf '\n  Exclude (comma-separated, empty to clear): ' >&2
-			local new_val=""
-			IFS= read -r new_val </dev/tty 2>/dev/null || true
-			tui_hide_cursor
+			tui_prompt "Exclude (comma-separated, empty to clear): "
+			local new_val="$TUI_REPLY"
 			if [[ -z "$new_val" ]]; then
 				EXCLUDE=()
 				_tui_push_msg "Exclude cleared"
@@ -2951,4 +2955,6 @@ main() {
 	fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi

@@ -12,7 +12,30 @@ Use standard Bash conventions. Follow [Google's Shell Style Guide](https://googl
 
 ## Testing
 
-Make sure your changes work correctly.
+The test suite requires Bash and jq. It mocks PipeWire commands and menu input, so it does not change your live audio routing.
+
+Run all tests with:
+
+```sh
+bash tests/run.sh
+```
+
+Run only the interactive stream-exclusion regression tests with:
+
+```sh
+bash tests/test-stream-exclusion.sh
+```
+
+### Coverage
+
+Coverage requires Ruby and Bundler. Install the locked dependencies, run the suite through Bashcov, and enforce the same 90% minimum line coverage used by CI:
+
+```sh
+bundle install
+TEST_PASSES=3 MINIMUM_COVERAGE=90 bundle exec bashcov --skip-uncovered tests/run.sh
+```
+
+The command writes an HTML report to `coverage/index.html` and a Cobertura report to `coverage/coverage.xml`.
 
 ## Pull Requests
 
